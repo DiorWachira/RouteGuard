@@ -77,6 +77,7 @@ export class Sandbox {
     this.nextChaosAt = 30;
     this.serial = 4200 + Math.floor(this.rng() * 500);
     this.version = 0;
+    this.stats = { dispatched: 0, delivered: 0, onTime: 0, delayH: 0, reroutes: 0, holds: 0, co2Kg: 0, costUsd: 0, teuKm: 0, transitH: 0 };
   }
 
   note(kind, text, ref = null) {
@@ -115,6 +116,7 @@ export class Sandbox {
       label,
     };
     this.shipments.unshift(s);
+    this.stats.dispatched++;
     if (this.shipments.length > 14) {
       const idx = this.shipments.findIndex((x, i) => i > 6 && x.phase === 'done');
       if (idx > -1) this.shipments.splice(idx, 1);
@@ -171,6 +173,16 @@ export class Sandbox {
         s.status = 'DELIVERED';
         s.deliveredAt = this.simHours - left;
         const late = s.deliveredAt - s.plannedEta;
+        const st = this.stats;
+        st.delivered++;
+        if (late <= 12) st.onTime++;
+        st.delayH += Math.max(0, late);
+        st.transitH += s.deliveredAt - s.departedAt;
+        for (const l of s.legs) {
+          st.co2Kg += l.co2;
+          st.costUsd += l.cost;
+          st.teuKm += l.distanceKm;
+        }
         const d = graph.nodes.get(s.dest);
         this.note('deliver', `${s.code.owner} ${s.code.serial} ${s.code.check} delivered at ${d.code} after ${fmtDuration(s.deliveredAt - s.departedAt)}${Math.abs(late) > 1 ? ` (${late > 0 ? '+' : '−'}${fmtDuration(Math.abs(late))} vs plan)` : ', on plan'}`, s.id);
       }
@@ -228,6 +240,7 @@ export class Sandbox {
           if (!s.holdReason) {
             s.holdReason = toMod?.closed ? `${graph.nodes.get(leg.to).name} closed ahead` : 'corridor closed ahead';
             s.status = 'HOLDING';
+            this.stats.holds++;
             this.note('hold', `${s.code.owner} ${s.code.serial} ${s.code.check} holding position — ${s.holdReason}`, s.id);
           }
           continue;
@@ -279,6 +292,7 @@ export class Sandbox {
       if (fresh && (!current || (freshScore < curScore * (1 - REROUTE_GAIN) && fresh.signature !== current.signature))) {
         next = fresh;
         s.reroutes++;
+        this.stats.reroutes++;
         s.status = 'REROUTED';
         const saved = current ? current.totals.hours - fresh.totals.hours : null;
         const via = fresh.nodes.slice(1, -1).map((id) => graph.nodes.get(id).code).join(' · ') || 'direct';
@@ -313,6 +327,27 @@ export class Sandbox {
       }
       out.push({ id: s.id, code: s.code, coords: p.coords, bearing: p.bearing, status: s.status, phase: s.phase, mode: leg.mode, shipment: s });
     }
+    return out;
+  }
+
+  /** Coordinates still ahead of a convoy: rest of the current leg, then every remaining leg. */
+  remainingPath(s, graph) {
+    if (!s || s.phase === 'done') return [];
+    const leg = s.legs[Math.min(s.legIdx, s.legs.length - 1)];
+    const out = [];
+    if (s.phase === 'underway') {
+      const t = leg.breakdown.travelH ? s.phaseElapsed / leg.breakdown.travelH : 1;
+      const u = unwrapCoords(leg.coords);
+      const cum = cumulative(u);
+      const total = cum[cum.length - 1] || 1;
+      out.push(pointAlong(leg.coords, t).coords);
+      for (let i = 0; i < u.length; i++) if (cum[i] / total > t) out.push(leg.coords[i]);
+    } else if (s.phase === 'depart') {
+      out.push(...leg.coords);
+    } else {
+      out.push(graph.nodes.get(s.dest).coords);
+    }
+    for (let i = s.legIdx + 1; i < s.legs.length; i++) out.push(...s.legs[i].coords.slice(1));
     return out;
   }
 

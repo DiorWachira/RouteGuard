@@ -80,6 +80,27 @@ try {
       await p.locator('#convoys').scrollIntoViewIfNeeded();
     },
   });
+  await shot('10-fig2-decision-regions', {
+    setup: async (p) => {
+      await p.getByRole('button', { name: /Suez/ }).first().click();
+      await p.waitForTimeout(2500);
+      await p.locator('#simplex-block').scrollIntoViewIfNeeded();
+      await p.waitForTimeout(1500);
+      const box = await p.locator('#simplex').boundingBox();
+      await p.mouse.move(box.x + box.width * 0.42, box.y + box.height * 0.62);
+    },
+  });
+  await shot('11-follow-convoy', {
+    palette: 'dusk',
+    setup: async (p) => {
+      await p.locator('#speed button', { hasText: '24×' }).click();
+      await p.getByRole('button', { name: 'Dispatch convoy' }).click();
+      await p.waitForTimeout(2500);
+      await p.locator('#convoys').scrollIntoViewIfNeeded();
+      await p.locator('.convoy').first().click();
+      await p.waitForTimeout(3500);
+    },
+  });
   await shot('07-mobile-night', { viewport: { width: 390, height: 844 } });
   await shot('08-mobile-day-telemetry', {
     viewport: { width: 390, height: 844 },

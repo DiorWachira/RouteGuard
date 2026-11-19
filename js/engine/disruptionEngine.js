@@ -89,37 +89,73 @@ function storageSet(key, value) {
   }
 }
 
-/** Deterministic pseudo-random sea state per node + UTC hour, used only when offline. */
-function syntheticWeather(network) {
-  const hour = Math.floor(Date.now() / 3600000);
-  const out = {};
-  for (const n of network.nodes) {
-    let seed = hour * 2654435761 + Math.round(n.coords[0] * 1000) * 40503 + Math.round(n.coords[1] * 1000) * 9973;
-    const rnd = () => {
-      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-      return seed / 0x7fffffff;
-    };
-    const lat = Math.abs(n.coords[1]);
-    const wind = 6 + rnd() * 26 + (lat > 40 ? 10 : 0) + (rnd() > 0.92 ? 30 : 0);
-    const precip = rnd() > 0.8 ? rnd() * 5 : 0;
-    const code = precip > 3 ? 63 : precip > 0 ? 61 : rnd() > 0.5 ? 2 : 0;
-    out[n.id] = { temp: Math.round((32 - lat * 0.55 + rnd() * 6) * 10) / 10, wind: Math.round(wind * 10) / 10, precip: Math.round(precip * 10) / 10, code, time: new Date().toISOString() };
+export const FORECAST_HOURS = 168;
+const CACHE_VERSION = 2;
+
+/** Weather sample points: every hub, plus the mid-point of every sea lane (open-ocean conditions). */
+export function weatherPoints(network) {
+  const pts = network.nodes.map((n) => ({ kind: 'node', id: n.id, coords: n.coords }));
+  for (const e of network.edges) {
+    if (e.mode !== 'MARITIME') continue;
+    pts.push({ kind: 'lane', id: e.id, coords: e.waypoints[Math.floor(e.waypoints.length / 2)] });
   }
-  return out;
+  return pts;
+}
+
+/** Deterministic synthetic 7-day hourly sea state, used only when Open-Meteo and the cache are unavailable. */
+function syntheticSeries(coords, hour0) {
+  let seed = Math.abs(Math.round(coords[0] * 1000) * 40503 + Math.round(coords[1] * 1000) * 9973 + Math.floor(hour0 / 24) * 7919);
+  const rnd = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed / 0x7fffffff;
+  };
+  const lat = Math.abs(coords[1]);
+  const base = 10 + rnd() * 18 + (lat > 40 ? 10 : 0);
+  const phase = rnd() * 24;
+  const gale = rnd() > 0.7 ? { at: Math.floor(rnd() * FORECAST_HOURS), len: 18 + Math.floor(rnd() * 30), peak: 30 + rnd() * 35 } : null;
+  const wind = [];
+  const precip = [];
+  const code = [];
+  const temp = [];
+  for (let h = 0; h < FORECAST_HOURS; h++) {
+    const inGale = gale && h >= gale.at && h < gale.at + gale.len;
+    const g = inGale ? Math.sin(((h - gale.at) / gale.len) * Math.PI) : 0;
+    const w = base + Math.sin((h + phase) / 7) * 6 + (inGale ? gale.peak * g : 0);
+    const p = inGale ? Math.max(0, 6 * g - 1) : 0;
+    wind.push(Math.round(Math.max(0, w) * 10) / 10);
+    precip.push(Math.round(p * 10) / 10);
+    code.push(p > 4 ? 65 : p > 0.5 ? 61 : w > 60 ? 95 : 2);
+    temp.push(Math.round((31 - lat * 0.55 + Math.sin(((h % 24) - 9) / 3.8) * 4) * 10) / 10);
+  }
+  return { wind, precip, code, temp };
+}
+
+function syntheticWeather(network) {
+  const hour0 = Math.floor(Date.now() / 3600000);
+  const startOfDay = hour0 - (hour0 % 24);
+  const series = {};
+  for (const p of weatherPoints(network)) series[`${p.kind}:${p.id}`] = syntheticSeries(p.coords, startOfDay);
+  return { status: 'SYNTHETIC', fetchedAt: Date.now(), startMs: startOfDay * 3600000, baseIndex: hour0 - startOfDay, series, version: CACHE_VERSION };
 }
 
 /**
- * Fetches current conditions for every node in the network in one batched request.
- * Resolves to { status: 'LIVE'|'CACHED'|'SYNTHETIC', fetchedAt, byNode: {id: {temp, wind, precip, code, time}} }.
+ * Fetches current conditions AND a 7-day hourly forecast for every hub and every sea-lane mid-point
+ * in one batched Open-Meteo request (comma-separated coordinates, no key).
+ * Resolves to { status: 'LIVE'|'CACHED'|'SYNTHETIC', fetchedAt, startMs, baseIndex,
+ *   series: {'node:SHA' | 'lane:EDGE-ID': {wind[], precip[], code[], temp[]}} }
+ * where series[k].wind[baseIndex] is "now". Read conditions at a sim time with weatherAt(w, simHours).
  */
-export async function fetchLiveWeather(network, { timeoutMs = 9000, fetchImpl = globalThis.fetch } = {}) {
+export async function fetchLiveWeather(network, { timeoutMs = 12000, fetchImpl = globalThis.fetch } = {}) {
   const cacheKey = CACHE_PREFIX + network.id;
   const cached = storageGet(cacheKey);
-  if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return { ...cached, status: 'CACHED' };
+  const cacheOk = cached && cached.version === CACHE_VERSION;
+  if (cacheOk && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return { ...cached, status: 'CACHED' };
 
-  const lat = network.nodes.map((n) => n.coords[1].toFixed(3)).join(',');
-  const lng = network.nodes.map((n) => n.coords[0].toFixed(3)).join(',');
-  const url = `${OPEN_METEO_URL}?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m,precipitation,weather_code&wind_speed_unit=kmh&timezone=GMT`;
+  const pts = weatherPoints(network);
+  const lat = pts.map((p) => p.coords[1].toFixed(2)).join(',');
+  const lng = pts.map((p) => p.coords[0].toFixed(2)).join(',');
+  const vars = 'temperature_2m,wind_speed_10m,precipitation,weather_code';
+  const url = `${OPEN_METEO_URL}?latitude=${lat}&longitude=${lng}&current=${vars}&hourly=${vars}&forecast_days=7&wind_speed_unit=kmh&timezone=GMT`;
   const ctrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
   const timer = ctrl ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   try {
@@ -128,22 +164,66 @@ export async function fetchLiveWeather(network, { timeoutMs = 9000, fetchImpl = 
     if (!res.ok) throw new Error(`Open-Meteo HTTP ${res.status}`);
     const json = await res.json();
     const arr = Array.isArray(json) ? json : [json];
-    const byNode = {};
-    network.nodes.forEach((n, i) => {
-      const c = arr[i]?.current;
-      if (!c) return;
-      byNode[n.id] = { temp: c.temperature_2m, wind: c.wind_speed_10m, precip: c.precipitation ?? 0, code: c.weather_code ?? 0, time: c.time };
+    const series = {};
+    let startMs = null;
+    let baseIndex = 0;
+    pts.forEach((p, i) => {
+      const r = arr[i];
+      const h = r?.hourly;
+      if (!h?.time?.length) return;
+      if (startMs == null) {
+        startMs = Date.parse(`${h.time[0]}:00Z`);
+        const nowIso = (r.current?.time ?? new Date().toISOString()).slice(0, 13);
+        baseIndex = Math.max(0, h.time.findIndex((t) => t.slice(0, 13) === nowIso));
+      }
+      const s = {
+        wind: h.wind_speed_10m.map((v) => v ?? 0),
+        precip: h.precipitation.map((v) => v ?? 0),
+        code: h.weather_code.map((v) => v ?? 0),
+        temp: h.temperature_2m.map((v) => v ?? 0),
+      };
+      // Splice the observed "current" reading into the base hour so T+0 matches the live observation.
+      if (r.current) {
+        s.wind[baseIndex] = r.current.wind_speed_10m ?? s.wind[baseIndex];
+        s.precip[baseIndex] = r.current.precipitation ?? s.precip[baseIndex];
+        s.code[baseIndex] = r.current.weather_code ?? s.code[baseIndex];
+        s.temp[baseIndex] = r.current.temperature_2m ?? s.temp[baseIndex];
+      }
+      series[`${p.kind}:${p.id}`] = s;
     });
-    if (!Object.keys(byNode).length) throw new Error('Open-Meteo returned no data');
-    const result = { status: 'LIVE', fetchedAt: Date.now(), byNode };
+    if (!Object.keys(series).length) throw new Error('Open-Meteo returned no data');
+    const result = { status: 'LIVE', fetchedAt: Date.now(), startMs, baseIndex, series, version: CACHE_VERSION };
     storageSet(cacheKey, result);
     return result;
   } catch (err) {
-    if (cached) return { ...cached, status: 'CACHED', error: String(err.message || err) };
-    return { status: 'SYNTHETIC', fetchedAt: Date.now(), byNode: syntheticWeather(network), error: String(err.message || err) };
+    if (cacheOk) return { ...cached, status: 'CACHED', error: String(err.message || err) };
+    return { ...syntheticWeather(network), error: String(err.message || err) };
   } finally {
     if (timer) clearTimeout(timer);
   }
+}
+
+/**
+ * Conditions at a sim time (hours after "now"), clamped to the 7-day forecast horizon.
+ * Returns { hour, lead, beyond, timeMs, byNode: {id: {wind, precip, code, temp}}, byLane: {edgeId: {...}} }.
+ */
+export function weatherAt(w, simHours = 0) {
+  if (!w?.series) return null;
+  const first = Object.values(w.series)[0];
+  const len = first?.wind?.length ?? 0;
+  if (!len) return null;
+  // Hours elapsed since the forecast was fetched also advance the base, so a cached forecast stays honest.
+  const drift = Math.max(0, Math.floor((Date.now() - w.fetchedAt) / 3600000));
+  const raw = w.baseIndex + drift + Math.floor(Math.max(0, simHours));
+  const idx = Math.min(len - 1, raw);
+  const byNode = {};
+  const byLane = {};
+  for (const [k, s] of Object.entries(w.series)) {
+    const v = { wind: s.wind[idx], precip: s.precip[idx], code: s.code[idx], temp: s.temp[idx] };
+    if (k.startsWith('node:')) byNode[k.slice(5)] = v;
+    else byLane[k.slice(5)] = v;
+  }
+  return { hour: idx, lead: idx - w.baseIndex - drift, beyond: raw > len - 1, timeMs: (w.startMs ?? Date.now()) + idx * 3600000, byNode, byLane };
 }
 
 /* ─────────────────────────── Disruption model ─────────────────────────── */
@@ -211,7 +291,7 @@ export function fuelShare(edge) {
  * Folds disruptions + live weather + fuel shock into pathfinder modifiers.
  * @returns ctx { nodeMods, edgeMods, fuelMultiplier(edge), minFuelMultiplier, fuelShockPct, edgePenalty:null, weatherHits }
  */
-export function compileContext(network, { disruptions = [], fuelShockPct = 0, weather = null, useWeather = true } = {}) {
+export function compileContext(network, { disruptions = [], fuelShockPct = 0, weather = null, useWeather = true, excludedModes = [] } = {}) {
   const nodeMods = new Map();
   const edgeMods = new Map();
   const nodeMod = (id) => {
@@ -258,6 +338,22 @@ export function compileContext(network, { disruptions = [], fuelShockPct = 0, we
   }
 
   const weatherHits = [];
+  if (useWeather && weather?.byLane) {
+    for (const e of network.edges) {
+      const lw = weather.byLane[e.id];
+      if (!lw) continue;
+      const imp = weatherImpact(lw);
+      if (!imp.severe) continue;
+      // Open-sea conditions act on the middle three-fifths of the passage.
+      const factor = 1 / (0.4 + 0.6 / imp.maritime);
+      if (factor >= 0.999) continue;
+      const m = edgeMod(e.id);
+      m.speedFactor *= factor;
+      m.co2Factor *= 1 + (1 - factor) * 0.5;
+      m.alerts.push({ kind: 'WEATHER', text: `Open-sea forecast: ${imp.reasons.join('; ')}`, id: `wxl-${e.id}` });
+      weatherHits.push(e.id);
+    }
+  }
   if (useWeather && weather?.byNode) {
     for (const e of network.edges) {
       const ia = weatherImpact(weather.byNode[e.from]);
@@ -281,7 +377,7 @@ export function compileContext(network, { disruptions = [], fuelShockPct = 0, we
   const shock = Math.max(-0.2, Math.min(1, fuelShockPct / 100));
   const fuelMultiplier = (edge) => 1 + shock * fuelShare(edge);
   const minFuelMultiplier = Math.min(...network.edges.map(fuelMultiplier));
-  return { nodeMods, edgeMods, fuelShockPct: shock * 100, fuelMultiplier, minFuelMultiplier, edgePenalty: null, weatherHits };
+  return { nodeMods, edgeMods, fuelShockPct: shock * 100, fuelMultiplier, minFuelMultiplier, edgePenalty: null, weatherHits, excludedModes: new Set(excludedModes) };
 }
 
 /* ─────────────────────────── One-click crisis presets ─────────────────────────── */
@@ -339,9 +435,9 @@ export const CRISIS_PRESETS = [
     short: 'Diesel +60%',
     cls: '4',
     network: 'EAFRICA',
-    origin: 'IOA',
-    destination: 'KGL',
-    blurb: 'Diesel jumps 60%. Trucking and fast mainline shipping absorb the most; rail and lake ferries gain share.',
+    origin: 'MBA',
+    destination: 'DOD',
+    blurb: 'Diesel jumps 60%. Trucking via Tanga loses its edge: Mombasa–Dodoma boxes shift to a coastal feeder and the Tanzania SGR.',
     build: () => ({ disruptions: [], fuelShockPct: 60 }),
   },
 ];

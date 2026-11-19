@@ -159,6 +159,7 @@ export function neutralContext() {
     fuelMultiplier: () => 1,
     minFuelMultiplier: 1,
     edgePenalty: null,
+    excludedModes: new Set(),
   };
 }
 
@@ -184,6 +185,7 @@ export function legMetrics(graph, edge, fromId, toId, prevMode, ctx, { isOrigin 
   const fMod = ctx.nodeMods.get(fromId);
   const tMod = ctx.nodeMods.get(toId);
   if (eMod?.closed || fMod?.closed || tMod?.closed) return null;
+  if (ctx.excludedModes?.has(edge.mode)) return null;
 
   const speedFactor = Math.min(1, eMod?.speedFactor ?? 1);
   const speed = edge.baseSpeedKmh * speedFactor;

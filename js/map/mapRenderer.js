@@ -349,8 +349,10 @@ export class MapRenderer {
     const { closedNodeIds, edgesSolid, edgesRoad, edgesClosed, hubs } = this.#memo(s);
     const slowed = (e) => (s.ctx.edgeMods.get(e.id)?.speedFactor ?? 1) < 0.97;
     const width = (e) => 0.8 + Math.max(0, Math.log10(e.capacityTeuWeek / 800)) * 0.9;
+    const excluded = new Set(s.excludedModes ?? []);
     const edgeColor = (e) => {
       const c = t.modes[e.mode];
+      if (excluded.has(e.mode)) return rgba(c, 38);
       const a = routeEdgeIds.has(e.id) ? 90 : t.corridorAlpha;
       return rgba(c, e.id === hoverEdge ? 255 : slowed(e) ? Math.min(255, a + 50) : a);
     };
@@ -364,7 +366,7 @@ export class MapRenderer {
       jointRounded: true,
       wrapLongitude: true,
       pickable: true,
-      updateTriggers: { getColor: [hoverEdge, selected?.signature, this.themeName, s.ctxVersion], getWidth: [hoverEdge] },
+      updateTriggers: { getColor: [hoverEdge, selected?.signature, this.themeName, s.ctxVersion, [...excluded].join()], getWidth: [hoverEdge] },
     };
 
     const storms = s.disruptions.filter((d) => d.kind === 'STORM');
@@ -392,11 +394,26 @@ export class MapRenderer {
 
     // Live weather: Beaufort flags at severe hubs
     const wxFlags = [];
-    if (s.weather?.byNode && s.useWeather) {
+    if (s.wx && s.useWeather) {
+      const flag = (w) => (w.wind > 45 ? `F${s.beaufort(w.wind).force}` : w.code >= 95 ? 'TS' : 'RA');
+      const severe = (w) => w && (w.wind > 45 || w.code >= 95 || w.precip >= 4);
       for (const n of net.nodes) {
-        const w = s.weather.byNode[n.id];
-        if (w && (w.wind > 45 || w.code >= 95 || w.precip >= 4)) wxFlags.push({ n, w, text: w.wind > 45 ? `F${s.beaufort(w.wind).force}` : w.code >= 95 ? 'TS' : 'RA' });
+        const w = s.wx.byNode[n.id];
+        if (severe(w)) wxFlags.push({ coords: n.coords, text: flag(w), offset: [16, -12] });
       }
+      for (const e of net.edges) {
+        const w = s.wx.byLane?.[e.id];
+        if (severe(w)) wxFlags.push({ coords: e.waypoints[Math.floor(e.waypoints.length / 2)], text: `≈${flag(w)}`, offset: [0, -10] });
+      }
+    }
+    // Declutter: at low zoom only label hubs that matter right now.
+    const lowZoom = (s.zoom ?? 3) < (net.id === 'GLOBAL' ? 2.6 : 6.1);
+    const keyHubs = new Set([s.origin, s.destination, ...(selected?.nodes ?? []), ...s.disruptions.map((d) => d.nodeId).filter(Boolean)]);
+    if (s.hover?.object?.id) keyHubs.add(s.hover.object.id);
+    const codeKey = `${net.id}|${lowZoom}|${[...keyHubs].join()}`;
+    if (this.codeKey !== codeKey) {
+      this.codeKey = codeKey;
+      this.codeData = lowZoom ? net.nodes.filter((n) => keyHubs.has(n.id)) : net.nodes;
     }
 
     const statusColor = (st) => (st === 'HOLDING' || st === 'STRANDED' ? t.hold : st === 'DELIVERED' ? t.inkDim : t.ink);
@@ -554,7 +571,7 @@ export class MapRenderer {
       }),
       new D.TextLayer({
         id: 'hub-codes',
-        data: net.nodes,
+        data: this.codeData,
         getPosition: (n) => n.coords,
         getText: (n) => n.id,
         getSize: (n) => (n.id === s.origin || n.id === s.destination ? 12 : 10),
@@ -589,11 +606,11 @@ export class MapRenderer {
       new D.TextLayer({
         id: 'wx-flags',
         data: wxFlags,
-        getPosition: (r) => r.n.coords,
+        getPosition: (r) => r.coords,
         getText: (r) => r.text,
         getSize: 10,
         sizeUnits: 'pixels',
-        getPixelOffset: [16, -12],
+        getPixelOffset: (r) => r.offset,
         getColor: rgba(t.hazard),
         fontFamily: '"Martian Mono", ui-monospace, monospace',
         fontWeight: 700,
@@ -615,6 +632,34 @@ export class MapRenderer {
         wrapLongitude: true,
         updateTriggers: { getIcon: [this.themeName] },
       }),
+      s.convoyPath?.length > 1 &&
+        new D.PathLayer({
+          id: 'convoy-track',
+          data: [{ path: s.convoyPath }],
+          getPath: (d) => d.path,
+          getColor: rgba(t.ink, 220),
+          getWidth: 2.5,
+          widthUnits: 'pixels',
+          wrapLongitude: true,
+          getDashArray: [4, 3],
+          dashJustified: true,
+          extensions: [new D.PathStyleExtension({ dash: true })],
+          updateTriggers: { getColor: [this.themeName] },
+        }),
+      s.selectedConvoy &&
+        new D.ScatterplotLayer({
+          id: 'convoy-ring',
+          data: [s.selectedConvoy],
+          getPosition: (c) => c.coords,
+          getRadius: 15 + pulse * 3,
+          radiusUnits: 'pixels',
+          stroked: true,
+          filled: false,
+          getLineColor: rgba(t.ink, 230),
+          lineWidthUnits: 'pixels',
+          getLineWidth: 1.5,
+          updateTriggers: { getRadius: [pulse], getLineColor: [this.themeName] },
+        }),
       new D.IconLayer({
         id: 'convoys',
         data: s.convoys,

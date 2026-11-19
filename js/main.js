@@ -7,7 +7,7 @@ import { NETWORKS, getNetwork, MODE_LABEL, NODE_TYPE_LABEL } from './data/corrid
 import { buildGraph, solveScenario, normaliseWeights, neutralContext } from './engine/pathfinder.js';
 import {
   fetchLiveWeather, compileContext, CRISIS_PRESETS, DISRUPTION_KINDS, makeCongestion, makeClosure, makeStorm,
-  describeTarget, beaufort, weatherLabel, weatherImpact,
+  describeTarget, beaufort, weatherLabel, weatherImpact, weatherAt,
 } from './engine/disruptionEngine.js';
 import { Sandbox, SPEEDS, fmtSimClock, fmtDuration } from './engine/simulation.js';
 import { makeCode } from './engine/iso6346.js';
@@ -15,11 +15,13 @@ import { MapRenderer, placardSvg, MAP_THEMES } from './map/mapRenderer.js';
 import { ParetoChart, legStrip } from './ui/telemetryCharts.js';
 import { fmtTransit, fmtUsd, fmtCo2, fmtKm, fmtHoursShort, signed, escapeHtml, MODE_SHORT, countUp } from './ui/format.js';
 import { Pilot, pilotSteps, FLAG_H } from './ui/pilot.js';
+import { SimplexMap } from './ui/simplexMap.js';
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false;
 const PALETTES = ['day', 'dusk', 'night'];
+const MODE_LETTER = { MARITIME: 'S', RAIL: 'R', ROAD: 'T' };
 
 /* ─────────────────────────────── State ─────────────────────────────── */
 
@@ -32,6 +34,11 @@ const state = {
   disruptions: [],
   useWeather: true,
   weather: null,
+  wx: null,
+  wxHour: null,
+  excludedModes: [],
+  selectedConvoy: null,
+  follow: false,
   palette: document.documentElement.getAttribute('data-palette') || 'night',
   tool: 'select',
   stormRadius: 600,
@@ -50,6 +57,11 @@ const state = {
 const sandbox = new Sandbox();
 let renderer = null;
 let pareto = null;
+let simplex = null;
+let simplexTimer = 0;
+let lastSceneKey = '';
+let lastFollowAt = 0;
+let lastWxRecalc = 0;
 let pilot = null;
 let lastPanelsAt = 0;
 let lastDriftRecalc = 0;
@@ -95,6 +107,7 @@ function writeHash() {
     `f=${state.fuelShockPct}`,
     `wx=${state.useWeather ? 1 : 0}`,
   ];
+  if (state.excludedModes.length) parts.push(`m=${['MARITIME', 'RAIL', 'ROAD'].filter((m) => !state.excludedModes.includes(m)).map((m) => MODE_LETTER[m]).join('')}`);
   if (state.disruptions.length) parts.push(`h=${b64urlEncode(state.disruptions.map(encodeDisruption))}`);
   const hash = `#${parts.join('&')}`;
   if (location.hash !== hash) history.replaceState(null, '', hash);
@@ -116,6 +129,9 @@ function readHash() {
     const f = Number(p.get('f'));
     if (isFinite(f)) state.fuelShockPct = Math.max(-20, Math.min(100, f));
     state.useWeather = p.get('wx') !== '0';
+    const allowed = p.get('m');
+    state.excludedModes = allowed ? ['MARITIME', 'RAIL', 'ROAD'].filter((m) => !allowed.includes(MODE_LETTER[m])) : [];
+    if (state.excludedModes.length === 3) state.excludedModes = [];
     state.disruptions = p.get('h') ? b64urlDecode(p.get('h')).map(decodeDisruption).filter(Boolean) : [];
     return true;
   } catch (err) {
@@ -164,9 +180,11 @@ function recompute({ fit = false, reason = null, quiet = false } = {}) {
   const net = network();
   if (!state.graph || state.graph.id !== net.id) state.graph = buildGraph(net);
   const prevSel = selectedRoute();
-  state.ctx = compileContext(net, { disruptions: state.disruptions, fuelShockPct: state.fuelShockPct, weather: state.weather, useWeather: state.useWeather });
+  state.wx = weatherAt(state.weather, sandbox.simHours);
+  state.wxHour = state.wx?.hour ?? null;
+  state.ctx = compileContext(net, { disruptions: state.disruptions, fuelShockPct: state.fuelShockPct, weather: state.wx, useWeather: state.useWeather, excludedModes: state.excludedModes });
   state.ctxVersion++;
-  const baselineCtx = compileContext(net, { disruptions: [], fuelShockPct: 0, weather: null, useWeather: false });
+  const baselineCtx = compileContext(net, { disruptions: [], fuelShockPct: 0, weather: null, useWeather: false, excludedModes: state.excludedModes });
   state.solution = solveScenario(state.graph, state.origin, state.destination, state.weights, state.ctx, { baselineCtx });
 
   if (state.selectedSig && !state.solution.candidates.some((r) => r.signature === state.selectedSig)) {
@@ -179,10 +197,48 @@ function recompute({ fit = false, reason = null, quiet = false } = {}) {
   sandbox.onContextChanged(state.graph, state.ctx, state.weights);
   renderPanels();
   renderHazards();
+  renderMeteoBadge();
+  scheduleSimplex();
   writeHash();
   if (fit && sel && renderer) renderer.fitRoute(sel.path, 70);
   if (reason) announce(reason);
   return state.solution;
+}
+
+/** Decision regions depend on network, O/D and hazards — not on the weights — so key on those only. */
+function contextKey() {
+  const dz = state.disruptions.map((d) => `${d.id}:${d.center ? d.center.map((v) => v.toFixed(1)).join('/') : ''}`).join(',');
+  return `${state.networkId}|${state.origin}|${state.destination}|${dz}|${state.fuelShockPct}|${state.useWeather ? state.wxHour : '-'}|${state.excludedModes.join('')}`;
+}
+
+function scheduleSimplex() {
+  if (!simplex) return;
+  simplex.setWeights(normaliseWeights(state.weights));
+  simplex.setSelected(selectedRoute()?.signature ?? null);
+  // Throttle (not debounce): a pending run always fires and reads the latest context, so a running
+  // sandbox that recomputes every forecast hour can never starve the map.
+  if (simplexTimer) return;
+  simplexTimer = setTimeout(() => {
+    simplexTimer = 0;
+    simplex.compute(state.graph, state.origin, state.destination, state.ctx, contextKey());
+  }, sandbox.running ? 400 : 60);
+}
+
+function renderMeteoBadge() {
+  const w = state.weather;
+  if (!w) return;
+  const net = network();
+  const wx = state.wx;
+  const severeHubs = wx ? net.nodes.filter((n) => weatherImpact(wx.byNode[n.id]).severe).length : 0;
+  const severeLanes = wx ? Object.values(wx.byLane).filter((v) => weatherImpact(v).severe).length : 0;
+  const lead = wx?.lead ?? 0;
+  $('#meteo-status').textContent = w.status;
+  const when = new Date(w.fetchedAt).toISOString().slice(11, 16);
+  const src = w.status === 'SYNTHETIC' ? 'offline model' : `obs ${when}Z`;
+  $('#meteo-detail').textContent = `${src} · severe: ${severeHubs} hub${severeHubs === 1 ? '' : 's'}, ${severeLanes} lane${severeLanes === 1 ? '' : 's'}`;
+  $('#meteo-badge').title = `${w.status === 'SYNTHETIC' ? 'Synthetic offline weather' : `Open-Meteo observations ${when} UTC + 7-day hourly forecast`} for every hub and sea lane. ${lead > 0 ? `The sandbox is reading the forecast for T+${lead} h${wx.beyond ? ' (end of the 7-day horizon)' : ''}.` : 'Showing current conditions.'} Click to refresh.`;
+  $('#meteo-badge').dataset.lead = lead > 0 ? 'forecast' : 'now';
+  $('#meteo-lead').textContent = lead > 0 ? `T+${lead}h` : '';
 }
 
 function selectedRoute() {
@@ -251,7 +307,7 @@ function renderPanels() {
           <span class="cand-rank mono">${String(i + 1).padStart(2, '0')}</span>
           <span class="cand-main">
             <span class="cand-tags">${tags.map((t) => `<span class="tag tag--${t}">${t}</span>`).join('')}${r.efficient ? '<span class="tag tag--pareto">pareto</span>' : ''}</span>
-            <span class="cand-via mono">${r.nodes.map(escapeHtml).join(' › ')}</span>
+            <span class="cand-via mono">${viaHtml(r)}</span>
             ${legStrip(r, { height: 6 })}
           </span>
           <span class="cand-nums mono"><b>${fmtTransit(r.totals.hours)}</b><span>${fmtUsd(r.totals.cost)}</span><span>${fmtCo2(r.totals.co2)}</span></span>
@@ -288,6 +344,11 @@ function renderPanels() {
       })
       .join('');
   }
+}
+
+/** Node codes joined by small mode marks (sea solid, rail solid, road dashed) — same hubs, different modes, now read differently. */
+function viaHtml(r) {
+  return r.nodes.map((id, i) => (i === 0 ? escapeHtml(id) : `<i class="hop hop--${r.legs[i - 1].mode.toLowerCase()}" title="${MODE_LABEL[r.legs[i - 1].mode]}"></i>${escapeHtml(id)}`)).join('');
 }
 
 function setDelta(sel, v, fmt, threshold) {
@@ -344,13 +405,25 @@ function renderHazards() {
   const net = network();
   const list = $('#hazard-list');
   $('#hazard-count').textContent = String(state.disruptions.length + (state.fuelShockPct ? 1 : 0));
-  const items = state.disruptions.map((d) => {
+  const leftText = (d) => {
     const left = d.durationH != null ? d.startedAt + d.durationH - sandbox.simHours : null;
+    return `${left != null ? `clears in ${fmtDuration(Math.max(0, left))}` : 'until removed'} · ${d.source}`;
+  };
+  const structure = `${state.palette}|${state.fuelShockPct}|${state.disruptions.map((d) => `${d.id}:${d.center ? d.center.map((v) => v.toFixed(1)).join('/') : ''}`).join(',')}`;
+  if (list.dataset.structure === structure) {
+    for (const d of state.disruptions) {
+      const el = list.querySelector(`[data-hz="${d.id}"] .hz-time`);
+      if (el) el.textContent = leftText(d);
+    }
+    return;
+  }
+  list.dataset.structure = structure;
+  const items = state.disruptions.map((d) => {
     const meta = d.kind === 'CONGESTION' ? `+${d.delayHours} h · +$${d.surchargeUsd}/TEU` : d.kind === 'STORM' ? `severity ${Math.round(d.severity * 100)}%` : 'impassable';
-    return `<li class="hazard">
+    return `<li class="hazard" data-hz="${d.id}">
       ${placardHtml(d.kind, 28)}
       <div class="hz-main"><b>${escapeHtml(d.label)}</b><span class="mono">${escapeHtml(describeTarget(d, net))} · ${meta}</span>
-      <span class="mono hz-time">${left != null ? `clears in ${fmtDuration(Math.max(0, left))}` : 'until removed'} · ${d.source}</span></div>
+      <span class="mono hz-time">${leftText(d)}</span></div>
       <button type="button" class="icon-btn" data-remove="${d.id}" aria-label="Remove hazard: ${escapeHtml(d.label)}">✕</button>
     </li>`;
   });
@@ -367,29 +440,69 @@ function renderSandboxPanels(force = false) {
   lastSandboxVersion = sandbox.version;
   const ships = sandbox.shipments.filter((s) => s.phase !== 'done' || sandbox.simHours - s.deliveredAt < 72);
   $('#convoy-count').textContent = String(sandbox.active.length);
+  const st = sandbox.stats;
+  const onTimePct = st.delivered ? Math.round((st.onTime / st.delivered) * 100) : null;
+  $('#scoreboard').innerHTML = [
+    ['Sailed', String(st.dispatched)],
+    ['Delivered', String(st.delivered)],
+    ['On time', onTimePct == null ? '—' : `${onTimePct}%`],
+    ['Avg delay', st.delivered ? fmtHoursShort(st.delayH / st.delivered) : '—'],
+    ['Reroutes', String(st.reroutes)],
+    ['Holds', String(st.holds)],
+    ['CO₂e', st.delivered ? fmtCo2(st.co2Kg) : '—'],
+    ['Spend', st.delivered ? fmtUsd(st.costUsd) : '—'],
+  ].map(([k, v]) => `<div><dt class="mono">${k}</dt><dd>${v}</dd></div>`).join('');
   const list = $('#convoy-list');
-  if (!ships.length) list.innerHTML = '<li class="empty">No convoys at sea. Press <b>Dispatch convoy</b> or <kbd>D</kbd> to launch one on the plotted track.</li>';
-  else {
-    list.innerHTML = ships
-      .slice(0, 8)
+  const shown = ships.slice(0, 8);
+  const row = (s) => {
+    const late = s.eta - s.plannedEta;
+    const leg = s.legs[Math.min(s.legIdx, s.legs.length - 1)];
+    const where = s.phase === 'done' ? `delivered ${s.dest}` : s.phase === 'underway' ? `${MODE_SHORT[leg.mode]} ${leg.from}→${leg.to}` : s.phase === 'depart' ? `at ${leg.from}` : `discharging ${s.dest}`;
+    return {
+      where,
+      prog: `${(sandbox.progress(s) * 100).toFixed(1)}%`,
+      eta: s.phase === 'done' ? fmtSimClock(s.deliveredAt) : `ETA ${fmtSimClock(s.eta)}`,
+      sub: `${Math.abs(late) > 1 ? signed(late, fmtHoursShort) : 'on plan'}${s.reroutes ? ` · ${s.reroutes}× rerouted` : ''}`,
+    };
+  };
+  // Rebuild rows only when the set/status of convoys changes; otherwise patch values in place so
+  // buttons are never replaced under the pointer (clicks and keyboard focus survive the ticking clock).
+  const structure = shown.map((s) => `${s.id}:${s.status}:${s.id === state.selectedConvoy}`).join('|');
+  if (!ships.length) {
+    list.innerHTML = '<li class="empty">No convoys at sea. Press <b>Dispatch convoy</b> or <kbd>D</kbd> to launch one on the plotted track.</li>';
+    list.dataset.structure = '';
+  } else if (list.dataset.structure !== structure) {
+    list.dataset.structure = structure;
+    list.innerHTML = shown
       .map((s) => {
-        const late = s.eta - s.plannedEta;
-        const prog = sandbox.progress(s);
-        const leg = s.legs[Math.min(s.legIdx, s.legs.length - 1)];
-        const where = s.phase === 'done' ? `delivered ${s.dest}` : s.phase === 'underway' ? `${MODE_SHORT[leg.mode]} ${leg.from}→${leg.to}` : s.phase === 'depart' ? `at ${leg.from}` : `discharging ${s.dest}`;
-        return `<li><button type="button" class="convoy" data-convoy="${s.id}">
-          <span class="plate" aria-label="Container ${s.code.compact}"><span class="plate-owner">${s.code.owner}</span><span class="plate-serial">${s.code.serial}</span><span class="plate-check">${s.code.check}</span></span>
-          <span class="convoy-mid"><span class="status status--${s.status.toLowerCase()} mono">${s.status.replace('_', ' ')}</span><span class="mono convoy-where">${escapeHtml(where)}</span>
-          <span class="convoy-bar"><i style="width:${(prog * 100).toFixed(1)}%"></i></span></span>
-          <span class="convoy-eta mono">${s.phase === 'done' ? fmtSimClock(s.deliveredAt) : `ETA ${fmtSimClock(s.eta)}`}<small>${Math.abs(late) > 1 ? signed(late, fmtHoursShort) : 'on plan'}${s.reroutes ? ` · ${s.reroutes}× rerouted` : ''}</small></span>
+        const r = row(s);
+        return `<li><button type="button" class="convoy${s.id === state.selectedConvoy ? ' is-sel' : ''}" data-convoy="${s.id}" aria-pressed="${s.id === state.selectedConvoy}">
+          ${plateHtml(s.code)}
+          <span class="convoy-mid"><span class="status status--${s.status.toLowerCase()} mono">${s.status.replace('_', ' ')}</span><span class="mono convoy-where">${escapeHtml(r.where)}</span>
+          <span class="convoy-bar"><i style="width:${r.prog}"></i></span></span>
+          <span class="convoy-eta mono"><span class="ce-eta">${r.eta}</span><small>${r.sub}</small></span>
         </button></li>`;
       })
       .join('');
+  } else {
+    for (const s of shown) {
+      const b = list.querySelector(`[data-convoy="${s.id}"]`);
+      if (!b) continue;
+      const r = row(s);
+      b.querySelector('.convoy-where').textContent = r.where;
+      b.querySelector('.convoy-bar i').style.width = r.prog;
+      b.querySelector('.ce-eta').textContent = r.eta;
+      b.querySelector('.convoy-eta small').textContent = r.sub;
+    }
   }
   const log = $('#deck-log');
-  log.innerHTML = sandbox.log.length
-    ? sandbox.log.slice(0, 40).map((e) => `<li class="log log--${e.kind}"><span class="mono log-t">${fmtSimClock(e.t)}</span><span>${escapeHtml(e.text)}</span></li>`).join('')
-    : '<li class="empty">The log opens when the first convoy sails.</li>';
+  const logKey = `${sandbox.log.length}:${sandbox.log[0]?.t}:${sandbox.log[0]?.text}`;
+  if (log.dataset.key !== logKey) {
+    log.dataset.key = logKey;
+    log.innerHTML = sandbox.log.length
+      ? sandbox.log.slice(0, 40).map((e) => `<li class="log log--${e.kind}"><span class="mono log-t">${fmtSimClock(e.t)}</span><span>${escapeHtml(e.text)}</span></li>`).join('')
+      : '<li class="empty">The log opens when the first convoy sails.</li>';
+  }
   renderHazards();
 }
 
@@ -492,6 +605,7 @@ function setNetwork(id, { origin, destination, silent = false, disruptions = nul
     const wasRunning = sandbox.running;
     sandbox.reset();
     setRunning(wasRunning);
+    clearConvoySelection();
     sandbox.note('info', `Chart changed to ${net.name}`);
     loadWeather();
   }
@@ -502,6 +616,10 @@ function setNetwork(id, { origin, destination, silent = false, disruptions = nul
     recompute({ reason: `${net.name} network` });
     renderSandboxPanels(true);
   }
+}
+
+function syncModeChips() {
+  $$('#mode-chips [data-mode]').forEach((b) => b.setAttribute('aria-pressed', String(!state.excludedModes.includes(b.dataset.mode))));
 }
 
 function buildSelects() {
@@ -547,7 +665,8 @@ function updateWeightOutputs() {
   $('.trim-t').style.flexGrow = n.time;
   $('.trim-c').style.flexGrow = n.cost;
   $('.trim-e').style.flexGrow = n.co2;
-  $('#weights-sum').textContent = `Σ w = ${(n.time + n.cost + n.co2).toFixed(2)} · w_t ${n.time.toFixed(2)} · w_c ${n.cost.toFixed(2)} · w_e ${n.co2.toFixed(2)}`;
+  $('#weights-sum').textContent = `Σ w = ${(n.time + n.cost + n.co2).toFixed(2)} — or drag the marker in Fig. 2`;
+  simplex?.setWeights(n);
   $('#w-time').value = String(state.weights.time);
   $('#w-cost').value = String(state.weights.cost);
   $('#w-co2').value = String(state.weights.co2);
@@ -586,14 +705,12 @@ async function loadWeather({ force = false } = {}) {
   const w = await fetchLiveWeather(net);
   if (state.networkId !== net.id) return;
   state.weather = w;
-  const severe = net.nodes.filter((n) => weatherImpact(w.byNode[n.id]).severe).length;
   badge.dataset.state = w.status.toLowerCase();
-  $('#meteo-status').textContent = w.status;
-  const when = new Date(w.fetchedAt).toISOString().slice(11, 16);
-  $('#meteo-detail').textContent = `${w.status === 'SYNTHETIC' ? 'offline model' : `Open-Meteo ${when} UTC`} · ${severe} severe hub${severe === 1 ? '' : 's'}`;
-  badge.title = w.error ? `Weather fallback (${w.error}). Click to retry.` : 'Live Open-Meteo telemetry. Click to refresh.';
+  if (w.error) badge.dataset.error = w.error;
   recompute({ quiet: true });
-  if (severe && state.useWeather) sandbox.note('hazard', `Meteo: ${severe} hub${severe === 1 ? '' : 's'} reporting severe conditions`);
+  const wx = state.wx;
+  const severe = wx ? Object.values(wx.byNode).concat(Object.values(wx.byLane)).filter((v) => weatherImpact(v).severe).length : 0;
+  if (severe && state.useWeather) sandbox.note('hazard', `Meteo: ${severe} hub/lane point${severe === 1 ? '' : 's'} reporting severe conditions`);
 }
 
 /* ─────────────────────────────── Map interaction ─────────────────────────────── */
@@ -602,22 +719,24 @@ function hoverCardHtml(h) {
   const o = h.object;
   const net = network();
   if (h.layer === 'hubs') {
-    const w = state.weather?.byNode?.[o.id];
+    const w = state.wx?.byNode?.[o.id];
     const m = state.ctx.nodeMods.get(o.id);
     const bf = w ? beaufort(w.wind) : null;
     return `<div class="hc-kicker mono">${NODE_TYPE_LABEL[o.type]} · ${o.code}</div><div class="hc-title">${escapeHtml(o.name)}</div>
       <dl class="hc-grid mono"><div><dt>Dwell</dt><dd>${o.baseDwellHours} h</dd></div><div><dt>Handling</dt><dd>${fmtUsd(o.handlingCostUsd)}</dd></div><div><dt>Cong. risk</dt><dd>${Math.round(o.congestionRisk * 100)}%</dd></div>
       ${w ? `<div><dt>Air</dt><dd>${w.temp?.toFixed?.(1) ?? w.temp}°C</dd></div><div><dt>Wind</dt><dd>${Math.round(w.wind)} km/h · F${bf.force}</dd></div><div><dt>Sky</dt><dd>${escapeHtml(weatherLabel(w.code))}</dd></div>` : ''}</dl>
-      ${w ? `<div class="hc-wx mono">${state.weather.status} METEO · ${escapeHtml(bf.name)}${w.precip ? ` · ${w.precip} mm` : ''}</div>` : ''}
+      ${w ? `<div class="hc-wx mono">${state.weather.status} METEO${state.wx.lead > 0 ? ` · FORECAST T+${state.wx.lead} h` : ' · NOW'} · ${escapeHtml(bf.name)}${w.precip ? ` · ${w.precip} mm` : ''}</div>` : ''}
       ${m?.alerts?.length ? `<ul class="hc-alerts">${m.alerts.map((a) => `<li>${escapeHtml(a.text)}</li>`).join('')}</ul>` : ''}
       <div class="hc-hint mono">Click for actions</div>`;
   }
   if (h.layer === 'corridors' || h.layer === 'corridors-road' || h.layer === 'closed') {
     const m = state.ctx.edgeMods.get(o.id);
     const sf = m?.speedFactor ?? 1;
+    const lw = state.wx?.byLane?.[o.id];
     return `<div class="hc-kicker mono"><span class="mode mode--${o.mode.toLowerCase()}">${MODE_SHORT[o.mode]}</span> corridor${o.isChokepoint ? ' · chokepoint' : ''}</div><div class="hc-title">${escapeHtml(o.label)}</div>
       <dl class="hc-grid mono"><div><dt>Distance</dt><dd>${fmtKm(o.distanceKm)}</dd></div><div><dt>Speed</dt><dd>${Math.round(o.baseSpeedKmh * sf)} km/h${sf < 0.99 ? ` (−${Math.round((1 - sf) * 100)}%)` : ''}</dd></div><div><dt>Rate</dt><dd>$${o.costPerTeuUsd.toFixed(2)}/TEU·km</dd></div>
       <div><dt>CO₂e</dt><dd>${(o.co2KgPerTeuKm * 1000).toFixed(0)} g/TEU·km</dd></div><div><dt>Capacity</dt><dd>${o.capacityTeuWeek.toLocaleString('en-US')} TEU/wk</dd></div><div><dt>Run</dt><dd>${fmtHoursShort(o.distanceKm / (o.baseSpeedKmh * sf))}</dd></div></dl>
+      ${lw ? `<div class="hc-wx mono">OPEN SEA${state.wx.lead > 0 ? ` T+${state.wx.lead} h` : ''} · ${Math.round(lw.wind)} km/h F${beaufort(lw.wind).force} · ${escapeHtml(weatherLabel(lw.code))}</div>` : ''}${state.excludedModes.includes(o.mode) ? '<div class="hc-wx mono">MODE EXCLUDED BY VOYAGE CONSTRAINTS</div>' : ''}
       ${m?.closed ? '<div class="hc-wx mono is-bad">CLOSED</div>' : ''}${m?.alerts?.length ? `<ul class="hc-alerts">${m.alerts.map((a) => `<li>${escapeHtml(a.text)}</li>`).join('')}</ul>` : ''}<div class="hc-hint mono">Click for actions</div>`;
   }
   if (h.layer === 'convoys') {
@@ -728,6 +847,7 @@ function onMapClick(h) {
     return;
   }
   if (h.layer === 'convoys') {
+    selectConvoy(o.id);
     renderer?.map.easeTo({ center: o.coords, duration: reducedMotion ? 0 : 600 });
   }
 }
@@ -807,12 +927,13 @@ function manifest() {
     voyage: { origin: state.origin, destination: state.destination },
     weights: normaliseWeights(state.weights),
     fuelShockPct: state.fuelShockPct,
-    weather: state.weather ? { status: state.weather.status, fetchedAt: new Date(state.weather.fetchedAt).toISOString(), applied: state.useWeather } : null,
+    weather: state.weather ? { status: state.weather.status, fetchedAt: new Date(state.weather.fetchedAt).toISOString(), applied: state.useWeather, forecastLeadHours: state.wx?.lead ?? 0 } : null,
+    allowedModes: ['MARITIME', 'RAIL', 'ROAD'].filter((m) => !state.excludedModes.includes(m)),
     disruptions: state.disruptions.map((d) => ({ kind: d.kind, label: d.label, target: describeTarget(d, net), ...encodeDisruption(d) })),
     plotted: sel ? { tags: [...sel.tags], pareto: sel.efficient, nodes: sel.nodes, totals: totals(sel), legs: legOut(sel) } : null,
     baselineCalm: sol?.baseline ? { nodes: sol.baseline.nodes, totals: totals(sol.baseline) } : null,
     candidates: sol?.candidates.map((r) => ({ tags: [...r.tags], pareto: r.efficient, nodes: r.nodes, modes: r.legs.map((l) => l.mode), totals: totals(r) })) ?? [],
-    sandbox: { simClock: fmtSimClock(sandbox.simHours), convoys: sandbox.shipments.map((s) => ({ container: s.code.compact, status: s.status, origin: s.origin, destination: s.dest, departed: fmtSimClock(s.departedAt), eta: fmtSimClock(s.eta), reroutes: s.reroutes })) },
+    sandbox: { simClock: fmtSimClock(sandbox.simHours), scoreboard: { ...sandbox.stats }, convoys: sandbox.shipments.map((s) => ({ container: s.code.compact, status: s.status, origin: s.origin, destination: s.dest, departed: fmtSimClock(s.departedAt), eta: fmtSimClock(s.eta), reroutes: s.reroutes })) },
     solveMs: sol ? +sol.computeMs.toFixed(2) : null,
   };
 }
@@ -895,9 +1016,29 @@ function frame(now) {
       lastDriftRecalc = now;
       recompute({ quiet: true });
     }
+    // The sim clock reads the hourly forecast: re-plan when the forecast hour changes (throttled).
+    if (state.weather && state.useWeather && now - lastWxRecalc > 600) {
+      const wx = weatherAt(state.weather, sandbox.simHours);
+      if (wx && wx.hour !== state.wxHour) {
+        lastWxRecalc = now;
+        recompute({ quiet: true });
+      }
+    }
     renderSandboxPanels();
   }
-  if (renderer && state.solution) {
+  const convoys = sandbox.positions(state.graph);
+  const followed = state.selectedConvoy ? convoys.find((c) => c.id === state.selectedConvoy) : null;
+  if (state.selectedConvoy && !followed) clearConvoySelection();
+  if (followed && state.follow && renderer && now - lastFollowAt > 900) {
+    lastFollowAt = now;
+    renderer.map.easeTo({ center: followed.coords, duration: reducedMotion ? 0 : 850, easing: (t) => t });
+  }
+  const plotProgress = reducedMotion ? 1 : Math.min(1, (now - state.plotStartedAt) / 900);
+  const zoomBucket = renderer?.map ? Math.round(renderer.map.getZoom() * 2) : 0;
+  const animating = sandbox.running || state.disruptions.length > 0 || plotProgress < 1;
+  const sceneKey = `${state.ctxVersion}|${selectedRoute()?.signature}|${state.hover?.object?.id ?? ''}|${state.hoverEdgeId}|${state.hoverRoute}|${state.palette}|${sandbox.version}|${state.selectedConvoy}|${zoomBucket}|${state.tool}`;
+  if (renderer && state.solution && (animating || sceneKey !== lastSceneKey)) {
+    lastSceneKey = sceneKey;
     renderer.render({
       network: network(),
       graph: state.graph,
@@ -906,10 +1047,14 @@ function frame(now) {
       disruptions: state.disruptions,
       ctx: state.ctx,
       ctxVersion: state.ctxVersion,
-      weather: state.weather,
+      wx: state.wx,
       useWeather: state.useWeather,
+      excludedModes: state.excludedModes,
       beaufort,
-      convoys: sandbox.positions(state.graph),
+      convoys,
+      selectedConvoy: followed ?? null,
+      convoyPath: followed ? sandbox.remainingPath(followed.shipment, state.graph) : null,
+      zoom: renderer.map ? renderer.map.getZoom() : 2,
       sandboxVersion: sandbox.version,
       origin: state.origin,
       destination: state.destination,
@@ -919,10 +1064,38 @@ function frame(now) {
       disrupted: isDisrupted(),
       tool: state.tool,
       now,
-      plotProgress: reducedMotion ? 1 : Math.min(1, (now - state.plotStartedAt) / 900),
+      plotProgress,
     });
   }
   requestAnimationFrame(frame);
+}
+
+/* ─────────────────────────────── Convoy follow ─────────────────────────────── */
+
+function selectConvoy(id, { follow = true } = {}) {
+  const s = sandbox.shipments.find((x) => x.id === id);
+  if (!s) return;
+  state.selectedConvoy = id;
+  state.follow = follow;
+  lastFollowAt = 0;
+  const chip = $('#follow-chip');
+  chip.hidden = false;
+  chip.querySelector('.fc-plate').innerHTML = plateHtml(s.code);
+  chip.querySelector('.fc-mode').textContent = follow ? 'Following' : 'Tracking';
+  chip.querySelector('[data-follow]').setAttribute('aria-pressed', String(follow));
+  renderSandboxPanels(true);
+  announce(`Tracking convoy ${s.code.compact}`);
+}
+
+function clearConvoySelection() {
+  state.selectedConvoy = null;
+  state.follow = false;
+  $('#follow-chip').hidden = true;
+  renderSandboxPanels(true);
+}
+
+function plateHtml(code) {
+  return `<span class="plate" aria-label="Container ${code.compact}"><span class="plate-owner">${code.owner}</span><span class="plate-serial">${code.serial}</span><span class="plate-check">${code.check}</span></span>`;
 }
 
 /* ─────────────────────────────── Wiring ─────────────────────────────── */
@@ -960,6 +1133,20 @@ function buildChrome() {
   $('#origin').addEventListener('change', (e) => setOD(e.target.value, state.destination));
   $('#destination').addEventListener('change', (e) => setOD(state.origin, e.target.value));
   $('#swap-od').addEventListener('click', () => setOD(state.destination, state.origin));
+  $('#mode-chips').addEventListener('click', (e) => {
+    const b = e.target.closest('[data-mode]');
+    if (!b) return;
+    const m = b.dataset.mode;
+    const ex = new Set(state.excludedModes);
+    if (ex.has(m)) ex.delete(m);
+    else if (ex.size < 2) ex.add(m);
+    else return toast('At least one mode', 'A voyage needs at least one allowed transport mode.', null);
+    state.excludedModes = [...ex];
+    state.selectedSig = null;
+    syncModeChips();
+    sandbox.note('info', `Voyage constraints: ${['MARITIME', 'RAIL', 'ROAD'].filter((x) => !ex.has(x)).map((x) => MODE_LABEL[x]).join(' + ')} only`);
+    recompute({ fit: true, reason: `Allowed modes: ${['MARITIME', 'RAIL', 'ROAD'].filter((x) => !ex.has(x)).join(', ')}` });
+  });
 
   // Weights
   let wTimer = 0;
@@ -1028,7 +1215,9 @@ function buildChrome() {
   $('#convoy-list').addEventListener('click', (e) => {
     const b = e.target.closest('.convoy');
     if (!b) return;
+    if (state.selectedConvoy === b.dataset.convoy) return clearConvoySelection();
     const p = sandbox.positions(state.graph).find((x) => x.id === b.dataset.convoy);
+    selectConvoy(b.dataset.convoy);
     if (p && renderer) renderer.map.easeTo({ center: p.coords, zoom: Math.max(renderer.map.getZoom(), state.networkId === 'GLOBAL' ? 3 : 6), duration: reducedMotion ? 0 : 700 });
   });
 
@@ -1066,6 +1255,7 @@ function buildChrome() {
     $('#chaos').checked = false;
     state.disruptions = state.disruptions.filter((d) => d.source !== 'chaos');
     $$('#speed button').forEach((x) => x.setAttribute('aria-checked', String(Number(x.dataset.speed) === sandbox.speed)));
+    clearConvoySelection();
     sandbox.note('info', 'Sandbox reset');
     recompute({ quiet: true });
     renderSandboxPanels(true);
@@ -1114,6 +1304,7 @@ function buildChrome() {
     if (e.key === 'Escape') {
       closePick();
       closeHelp();
+      if (state.selectedConvoy) clearConvoySelection();
       if (state.tool !== 'select') setTool('select');
       return;
     }
@@ -1146,6 +1337,7 @@ function buildChrome() {
       $('#fuel').value = String(state.fuelShockPct);
       updateFuelOut();
       $('#use-weather').checked = state.useWeather;
+      syncModeChips();
       recompute({ fit: before !== `${state.networkId}|${state.origin}|${state.destination}` });
     }
   });
@@ -1162,6 +1354,28 @@ function init() {
   updateFuelOut();
   $('#use-weather').checked = state.useWeather;
   $('#lg-placard').innerHTML = placardHtml('CONGESTION', 16);
+
+  syncModeChips();
+  simplex = new SimplexMap($('#simplex'), {
+    readout: $('#simplex-readout'),
+    legend: $('#simplex-legend'),
+    announce,
+    onPick: (w) => {
+      state.weights = w;
+      state.selectedSig = null;
+      updateWeightOutputs();
+      recompute({ quiet: true });
+    },
+  });
+  $('#follow-chip').addEventListener('click', (e) => {
+    if (e.target.closest('[data-unfollow]')) return clearConvoySelection();
+    if (e.target.closest('[data-follow]')) {
+      state.follow = !state.follow;
+      lastFollowAt = 0;
+      e.target.closest('[data-follow]').setAttribute('aria-pressed', String(state.follow));
+      $('#follow-chip .fc-mode').textContent = state.follow ? 'Following' : 'Tracking';
+    }
+  });
 
   pareto = new ParetoChart($('#pareto'), {
     readout: $('#pareto-readout'),
@@ -1194,6 +1408,13 @@ function init() {
     },
   });
   if (renderer.failed) renderer = null;
+  renderer?.map.on('dragstart', () => {
+    if (state.follow) {
+      state.follow = false;
+      $('#follow-chip .fc-mode').textContent = 'Tracking';
+      $('#follow-chip [data-follow]').setAttribute('aria-pressed', 'false');
+    }
+  });
   setPalette(state.palette, { persist: false });
 
   recompute({ quiet: true });

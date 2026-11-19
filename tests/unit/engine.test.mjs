@@ -141,3 +141,48 @@ test('congestion raises transit time on the baseline path', () => {
   const again = evaluatePath(graph, base.steps, ctx);
   assert.ok(again.totals.hours > base.totals.hours + 47);
 });
+
+test('forecast: weatherAt advances with sim time and lane storms slow sea legs', async () => {
+  const { weatherAt, weatherPoints } = await import('../../js/engine/disruptionEngine.js');
+  const net = NETWORKS.GLOBAL;
+  const pts = weatherPoints(net);
+  assert.equal(pts.filter((p) => p.kind === 'lane').length, net.edges.filter((e) => e.mode === 'MARITIME').length);
+  const series = {};
+  for (const p of pts) {
+    const calm = Array.from({ length: 168 }, () => 10);
+    const wind = p.kind === 'lane' && p.id === 'CMB-BAB-M' ? calm.map((v, h) => (h >= 48 ? 95 : v)) : calm;
+    series[`${p.kind}:${p.id}`] = { wind, precip: calm.map(() => 0), code: calm.map(() => 2), temp: calm.map(() => 25) };
+  }
+  const w = { fetchedAt: Date.now(), startMs: Date.now(), baseIndex: 0, series };
+  const now = weatherAt(w, 0);
+  const later = weatherAt(w, 60);
+  assert.equal(now.byLane['CMB-BAB-M'].wind, 10);
+  assert.equal(later.byLane['CMB-BAB-M'].wind, 95);
+  assert.equal(later.lead, 60);
+  assert.ok(weatherAt(w, 500).beyond);
+  const calmCtx = compileContext(net, { weather: now });
+  const stormCtx = compileContext(net, { weather: later });
+  assert.equal(calmCtx.edgeMods.get('CMB-BAB-M'), undefined);
+  assert.ok(stormCtx.edgeMods.get('CMB-BAB-M').speedFactor < 0.9);
+});
+
+test('mode constraints: excluding rail removes the land bridge, and all routes respect it', () => {
+  const net = NETWORKS.GLOBAL;
+  const graph = buildGraph(net);
+  const ctx = compileContext(net, { disruptions: [makeClosure({ nodeId: 'SUZ' })], excludedModes: ['RAIL'] });
+  const s = solveScenario(graph, 'SHA', 'RTM', { time: 1, cost: 0, co2: 0 }, ctx);
+  assert.ok(s.candidates.length > 0);
+  for (const r of s.candidates) assert.ok(r.legs.every((l) => l.mode !== 'RAIL'), r.nodes.join(' '));
+  assert.ok(!s.fastest.nodes.includes('XIY'));
+});
+
+test('diesel drill shifts Mombasa–Dodoma off the road', () => {
+  const net = NETWORKS.EAFRICA;
+  const graph = buildGraph(net);
+  const p = CRISIS_PRESETS.find((x) => x.id === 'diesel');
+  const w = { time: 40, cost: 35, co2: 25 };
+  const roadKm = (r) => r.legs.filter((l) => l.mode === 'ROAD').reduce((a, l) => a + l.distanceKm, 0);
+  const calm = astar(graph, p.origin, p.destination, w, compileContext(net, {}));
+  const shock = astar(graph, p.origin, p.destination, w, compileContext(net, p.build()));
+  assert.ok(roadKm(shock) < roadKm(calm), `${roadKm(calm)} -> ${roadKm(shock)}`);
+});

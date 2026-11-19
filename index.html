@@ -49,6 +49,7 @@
         <span class="lamp" aria-hidden="true"></span>
         <span class="meteo-text mono"><b id="meteo-status">LOADING</b> METEO TELEMETRY</span>
         <span class="meteo-detail mono" id="meteo-detail">Open-Meteo · contacting</span>
+        <span class="meteo-lead mono" id="meteo-lead" aria-hidden="true"></span>
       </button>
       <div class="palette-switch" role="radiogroup" aria-label="Display palette (S-52 day, dusk, night)">
         <button type="button" role="radio" data-palette="day" aria-checked="false" title="Day palette">Day</button>
@@ -83,6 +84,14 @@
             <span class="field-label mono">Destination</span>
             <select id="destination"></select>
           </label>
+        </div>
+        <div class="modes" role="group" aria-labelledby="modes-label">
+          <span class="field-label mono" id="modes-label">Allowed modes</span>
+          <div class="mode-chips" id="mode-chips">
+            <button type="button" class="mode-chip" data-mode="MARITIME" aria-pressed="true"><i class="hop hop--maritime" aria-hidden="true"></i>Sea</button>
+            <button type="button" class="mode-chip" data-mode="RAIL" aria-pressed="true"><i class="hop hop--rail" aria-hidden="true"></i>Rail</button>
+            <button type="button" class="mode-chip" data-mode="ROAD" aria-pressed="true"><i class="hop hop--road" aria-hidden="true"></i>Road</button>
+          </div>
         </div>
       </section>
 
@@ -161,6 +170,11 @@
         <div class="lg-row"><i class="lg-ghost"></i><span>Calm-world plan</span><span class="lg-placard" id="lg-placard"></span><span>Hazard</span></div>
       </div>
 
+      <div class="follow-chip" id="follow-chip" role="status" hidden>
+        <span class="fc-mode mono">Following</span><span class="fc-plate"></span>
+        <button type="button" class="chip" data-follow aria-pressed="true" title="Keep the chart centred on this convoy">Follow</button>
+        <button type="button" class="icon-btn" data-unfollow aria-label="Stop tracking convoy (Esc)">✕</button>
+      </div>
       <div class="hover-card" id="hover-card" role="status" hidden></div>
       <div class="pick-card" id="pick-card" role="dialog" aria-label="Chart object actions" hidden></div>
 
@@ -224,6 +238,16 @@
         </details>
       </section>
 
+      <section class="block" id="simplex-block" aria-labelledby="h-simplex">
+        <h3 id="h-simplex"><span class="sec mono">Fig. 2</span> Decision regions</h3>
+        <div class="simplex-wrap" id="simplex-wrap">
+          <canvas id="simplex" tabindex="0" role="img" aria-label="Weight triangle. Each region shows which route is optimal for that mix of time, cost and carbon weights. Click or drag to set weights; arrow keys nudge them."></canvas>
+          <div class="readout readout--simplex" id="simplex-readout" aria-live="polite"></div>
+        </div>
+        <ol class="simplex-legend" id="simplex-legend"></ol>
+        <p class="caption"><b>Fig. 2</b> — Every point is a weight mix. A* was run across the whole triangle; each region is the set of mixes where one route wins, outlined where the plan flips. Magenta marks the plotted track’s region; the crosshair is your current mix.</p>
+      </section>
+
       <section class="block" aria-labelledby="h-cands">
         <h3 id="h-cands"><span class="sec mono">§5</span> Candidate routes</h3>
         <ol class="cands" id="cands"></ol>
@@ -237,6 +261,7 @@
 
       <section class="block" id="convoys" aria-labelledby="h-convoys">
         <h3 id="h-convoys"><span class="sec mono">§7</span> Convoys at sea <span class="count mono" id="convoy-count">0</span></h3>
+        <dl class="scoreboard" id="scoreboard" aria-label="Sandbox scoreboard"></dl>
         <ul class="convoy-list" id="convoy-list"></ul>
         <h4 class="sub mono">Deck log</h4>
         <ol class="deck-log" id="deck-log" aria-live="off"></ol>
@@ -255,7 +280,7 @@
       <section>
         <h3><span class="sec mono">01</span> Pilot</h3>
         <div class="row wrap">
-          <button type="button" class="btn btn--primary" data-tour="all">Full passage (13 steps)</button>
+          <button type="button" class="btn btn--primary" data-tour="all">Full passage (14 steps)</button>
           <button type="button" class="btn" data-tour="chart">Chart only</button>
           <button type="button" class="btn" data-tour="plan">Passage plan</button>
           <button type="button" class="btn" data-tour="telemetry">Telemetry</button>
@@ -280,10 +305,10 @@
       <section>
         <h3><span class="sec mono">03</span> How it works</h3>
         <ol class="pipeline">
-          <li><b>Observe</b> Open-Meteo wind, rain and weather code for every hub (one batched call; cached, synthetic fallback offline).</li>
+          <li><b>Observe</b> Open-Meteo observations and a 7-day hourly forecast for every hub and every sea-lane mid-point (one batched call; cached; synthetic fallback offline). The sim clock reads the forecast as it advances.</li>
           <li><b>Compile</b> Weather, strikes, closures, storm cells and fuel shock become per-hub and per-corridor modifiers.</li>
           <li><b>Search</b> Multi-objective A* over (hub × arrival mode) states with a binary min-heap and an admissible great-circle heuristic.</li>
-          <li><b>Compare</b> Fastest, cheapest, greenest and edge-penalised alternates, plus a weight-simplex sweep, filtered to the Pareto set.</li>
+          <li><b>Compare</b> Fastest, cheapest, greenest and edge-penalised alternates, plus a weight-simplex sweep, filtered to the Pareto set; Fig. 2 maps which route wins across the whole weight triangle.</li>
           <li><b>Simulate</b> Convoys advance on the sim clock and re-plan at the next hub whenever the context changes.</li>
         </ol>
       </section>
@@ -299,6 +324,8 @@
           <div><dt>A*</dt><dd>Best-first search guided by a lower bound on the remaining cost. With an admissible bound it is exact.</dd></div>
           <div><dt>Beaufort</dt><dd>Wind force 0–12. RouteGuard flags hubs above 45 km/h (about force 7).</dd></div>
           <div><dt>SGR / MGR</dt><dd>Standard-gauge and metre-gauge railway, e.g. Kenya's Mombasa–Nairobi SGR.</dd></div>
+          <div><dt>Decision region</dt><dd>The set of weight mixes for which one route is optimal (Fig. 2).</dd></div>
+          <div><dt>Forecast T+n</dt><dd>Weather the sandbox is using: n hours after now, read from the 7-day hourly forecast.</dd></div>
           <div><dt>ICD</dt><dd>Inland container depot (dry port), such as Nairobi ICD or Naivasha.</dd></div>
           <div><dt>ISO 6346</dt><dd>Container numbering: owner code, category, serial and a check digit, shown boxed.</dd></div>
           <div><dt>Day / Dusk / Night</dt><dd>Display palettes modelled on ECDIS (IHO S-52) bridge colour tables.</dd></div>

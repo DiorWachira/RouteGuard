@@ -56,7 +56,7 @@ export class ParetoChart {
       this.canvas.style.width = `${w}px`;
       this.canvas.style.height = `${h}px`;
     }
-    return { w, h, dpr, pad: { l: 50, r: 16, t: 14, b: 38 } };
+    return { w, h, dpr, pad: { l: 50, r: 16, t: 26, b: 38 } };
   }
 
   draw() {
@@ -130,12 +130,8 @@ export class ParetoChart {
     g.fillStyle = ink2;
     g.textAlign = 'left';
     g.fillText('LANDED COST  USD / TEU  →', pad.l, h - 14);
-    g.save();
-    g.translate(11, pad.t + 2);
-    g.rotate(Math.PI / 2);
-    g.textBaseline = 'middle';
-    g.fillText('← TRANSIT  DAYS', 0, 0);
-    g.restore();
+    g.textBaseline = 'top';
+    g.fillText('TRANSIT · DAYS  (↓ FASTER)', 4, 4);
 
     // 2-D cost/time frontier staircase
     const sorted = [...all].sort((a, b) => a.totals.cost - b.totals.cost);
@@ -174,16 +170,14 @@ export class ParetoChart {
       g.moveTo(bx + 5, by - 5);
       g.lineTo(bx - 5, by + 5);
       g.stroke();
-      g.fillStyle = hazard;
-      g.font = mono;
-      g.textAlign = 'left';
-      g.textBaseline = 'bottom';
-      g.fillText('CALM', bx + 7, by - 3);
-    }
+      this.calmAt = { x: bx, y: by };
+    } else this.calmAt = null;
 
     // points: dominated first, then efficient, then selected on top
     this.points = all.map((r) => ({ route: r, x: X(r.totals.cost), y: Y(r.totals.hours / 24), r: R(r.totals.co2) }));
     const order = [...this.points].sort((a, b) => (a.route === selected) - (b.route === selected) || (a.route.efficient - b.route.efficient) || b.r - a.r);
+    const placed = [];
+    const labels = [];
     for (const p of order) {
       const isSel = p.route === selected;
       const isHover = this.points[this.hoverIdx] === p || this.points[this.focusIdx] === p;
@@ -215,13 +209,44 @@ export class ParetoChart {
         g.strokeStyle = isSel ? signal : ink;
         g.stroke();
       }
-      const letters = [...p.route.tags].map((t) => TAG_LETTER[t]).filter(Boolean).join('');
-      if (letters) {
-        g.font = '600 10px "Martian Mono", ui-monospace, monospace';
+      const letters = [...p.route.tags].map((t) => TAG_LETTER[t]).filter(Boolean).join(' ');
+      if (letters) labels.push({ p, letters, isSel });
+      placed.push({ x0: p.x - p.r, x1: p.x + p.r, y0: p.y - p.r, y1: p.y + p.r });
+    }
+    // Direct tag labels: try right, left, above, below; skip if all collide (selected first).
+    g.font = '600 10px "Martian Mono", ui-monospace, monospace';
+    g.textBaseline = 'middle';
+    labels.sort((a, b) => b.isSel - a.isSel);
+    const hit = (r) => placed.some((q) => r.x0 < q.x1 && r.x1 > q.x0 && r.y0 < q.y1 && r.y1 > q.y0);
+    for (const { p, letters, isSel } of labels) {
+      const tw = g.measureText(letters).width;
+      const opts = [
+        [p.x + p.r + 4, p.y, 'left'],
+        [p.x - p.r - 4 - tw, p.y, 'left'],
+        [p.x - tw / 2, p.y - p.r - 8, 'left'],
+        [p.x - tw / 2, p.y + p.r + 8, 'left'],
+      ];
+      for (const [x, y] of opts) {
+        const r = { x0: x - 1, x1: x + tw + 1, y0: y - 6, y1: y + 6 };
+        if (x < pad.l || x + tw > w - 2 || hit(r)) continue;
         g.fillStyle = isSel ? signal : ink2;
         g.textAlign = 'left';
-        g.textBaseline = 'middle';
-        g.fillText(letters, p.x + p.r + 4, p.y);
+        g.fillText(letters, x, y);
+        placed.push(r);
+        break;
+      }
+    }
+    // Calm-baseline label, placed last so it never hides behind a bubble.
+    if (this.calmAt) {
+      const { x: bx, y: by } = this.calmAt;
+      const tw = g.measureText('CALM').width;
+      for (const [x, y] of [[bx + 8, by], [bx - 8 - tw, by], [bx - tw / 2, by - 12], [bx - tw / 2, by + 12]]) {
+        const r = { x0: x - 1, x1: x + tw + 1, y0: y - 6, y1: y + 6 };
+        if (x < pad.l || x + tw > w - 2 || hit(r)) continue;
+        g.fillStyle = hazard;
+        g.textAlign = 'left';
+        g.fillText('CALM', x, y);
+        break;
       }
     }
   }

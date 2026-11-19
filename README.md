@@ -1,6 +1,8 @@
 # RouteGuard — Geospatial Supply-Chain & Logistics Disruption Simulator
 
-An interactive 2D logistics command centre built with **MapLibre GL JS 4.7.1** and **Deck.gl 8.9.35**. Plot cargo routes across ports, rail corridors and highways, inject real disruptions such as live **Open-Meteo** weather, port strikes, chokepoint closures and fuel shocks, and watch a **multi-objective A\*** engine re-plot the optimal passage in a few milliseconds. A **live sandbox** runs a simulation clock: convoys sail, hazards appear and clear, and every convoy re-plans itself at its next hub.
+An interactive 2D logistics command centre built with **MapLibre GL JS 4.7.1** and **Deck.gl 8.9.35**. Plot cargo routes across ports, rail corridors and highways, inject real disruptions such as live **Open-Meteo** weather, port strikes, chokepoint closures and fuel shocks, and watch a **multi-objective A\*** engine re-plot the optimal passage in a few milliseconds. A **live sandbox** runs a simulation clock driven by the real **7-day hourly forecast** for every hub and sea lane: convoys sail, weather systems arrive on schedule, hazards appear and clear, and every convoy re-plans itself at its next hub.
+
+**Live demo:** https://diorwachira.github.io/RouteGuard/
 
 Zero build, zero API keys. Open `index.html` through any static server, or deploy to GitHub Pages as-is.
 
@@ -51,7 +53,10 @@ The simulator starts running. One convoy is already at sea on the plotted Shangh
 | Press **1** (*Suez Canal Blockage*) | The canal closes. The track re-plots in under 16 ms, the calm-world plan stays as a dotted ghost, and the convoy at sea re-plans at its next hub (Cape route) or holds position if the closed node is directly ahead. |
 | Press **2** (*Indian Ocean Cyclone*) | A drifting storm cell crosses the Arabian Sea. Every lane it intersects slows in proportion to how much of the lane lies inside the cell. |
 | Press **3** (*Mombasa Port Berth Strike*) | Switches to the East Africa network. Kampala-bound cargo diverts through Dar es Salaam, the Central Line and the Lake Victoria wagon ferry. |
-| Press **4** (*Diesel +60%*) | Trucking and fast mainline shipping costs jump. Watch $/TEU and the Pareto frontier move. |
+| Press **4** (*Diesel +60%*) | Trucking and fast mainline shipping costs jump. Mombasa → Dodoma cargo moves off the Tanga road onto a coastal feeder and the Tanzania SGR. |
+| Drag the crosshair in **Fig. 2** | Sets the weights directly on the weight triangle. The regions show how far your priorities can move before the plan flips. |
+| Untick **Rail** under *Allowed modes* | Voyage constraint, e.g. for cargo that cannot travel by rail. Every candidate, alternate and convoy respects it, and it is saved in the link. |
+| Click a convoy (list or chart) | Follows it, draws its track ahead and rings it on the chart. Esc releases it. The scoreboard tallies on-time %, delay, reroutes, holds, CO₂e and spend. |
 | Click any hub | Set origin or destination, inject a strike or gridlock, close it, or drop a storm on it. |
 | **Storm / Strike / Close** tools | Click anywhere on the chart to inject your own trouble. |
 | Toggle **Chaos** | Random strikes, storms and closures spawn every few sim-days and clear on their own. |
@@ -70,13 +75,14 @@ index.html ─┬─ css/styles.css                     Night/Dusk/Day tokens, c
                  ├─ js/engine/iso6346.js          container numbers with valid check digits
                  ├─ js/map/mapRenderer.js         MapLibre basemap re-tint + Deck.gl MapboxOverlay layer stack
                  ├─ js/ui/telemetryCharts.js      high-DPI canvas Pareto chart · proportional leg strips
+                 ├─ js/ui/simplexMap.js           Fig. 2: decision regions on the weight simplex (chunked A* sweep)
                  ├─ js/ui/pilot.js                first-run guide (coach marks)
                  └─ js/ui/format.js               formatting + count-up
 ```
 
 **Recalculation pipeline**, run on every change to weights, hazards, fuel, weather or voyage:
 
-1. **Observe**: Open-Meteo current conditions for every hub, in one batched request.
+1. **Observe**: Open-Meteo observations plus a 7-day hourly forecast for every hub and every sea-lane mid-point, in one batched request. `weatherAt(w, simHours)` reads the forecast hour that matches the sandbox clock.
 2. **Compile**: `compileContext()` folds weather, strikes, closures, storm cells and fuel shock into per-node and per-edge modifiers (`closed`, `speedFactor ≤ 1`, `co2Factor ≥ 1`, `delayHours`, `surchargeUsd`).
 3. **Search**: `solveScenario()` runs optimal, fastest, cheapest and greenest solves, K = 4 edge-penalised alternates and a 21-point weight-simplex sweep, then de-duplicates and filters to the Pareto set. It also computes the calm-world baseline and *what the old plan costs now*. A full solve of 30-plus A* runs takes **4–20 ms** on a laptop.
 4. **Render**: Deck.gl layers update through prop diffing. Corridor arrays are memoised per context version, so GPU attributes rebuild only when the hazard picture changes.
@@ -134,11 +140,17 @@ Every edge is at least as long as the straight line between its ends (tortuosity
 - *Simplex sweep*: solve at 21 weight vectors on a 1/5 grid of the simplex.
 - Merge and de-duplicate by edge signature, then keep the non-dominated set over (hours, USD/TEU, kg CO₂e). Fig. 1 draws the 2-D cost/time frontier as a staircase, with bubble area proportional to CO₂e.
 
+**Fig. 2: decision regions on the weight simplex.** The triangle of all weight mixes ($w_t+w_c+w_e=1$) is tessellated into $N^2 = 144$ cells, and A\* runs at each cell's centroid weights. Cells with the same winning route form a *decision region*, outlined where the winner changes, and each region's share of the triangle is listed. The plotted route's region is magenta and the others use ink hatches and letters, so colour never carries identity alone. Winners depend only on network, O/D, hazards and mode constraints, never on the current weights, so the map is computed off the main path in 10 ms time slices, throttled, and cancelled by newer requests. Dragging the crosshair sets the weights; arrow keys nudge them.
+
+**Mode constraints.** *Allowed modes* removes whole modes from the graph (`ctx.excludedModes`). Removing edges can only raise costs, so the heuristic stays admissible.
+
 **Baseline deltas.** The KPI header compares the plotted route with the *calm-world* optimum (no hazards, no fuel shock, no weather). It also re-evaluates the calm plan under today's hazards, which is where *"Avoided 4.1 d trap on the old track"* and *"Avoided blocked Suez Canal"* come from.
 
 ## Live Open-Meteo integration
 
-- **Endpoint:** `https://api.open-meteo.com/v1/forecast?latitude=…&longitude=…&current=temperature_2m,wind_speed_10m,precipitation,weather_code`. This is a single request with comma-separated coordinates for all hubs (31 or 22), and it needs no API key.
+- **Endpoint:** `https://api.open-meteo.com/v1/forecast?latitude=…&longitude=…&current=…&hourly=temperature_2m,wind_speed_10m,precipitation,weather_code&forecast_days=7`. This is a single request with comma-separated coordinates for **every hub and the mid-point of every sea lane** (74 points on the global network, 30 on East Africa), and it needs no API key.
+- **Forecast-driven sandbox:** T+0 is the live observation. As the sim clock advances, the router reads the forecast for that hour (T+36 h, T+120 h…, held at the 7-day horizon), so a gale forecast for Thursday in the Bay of Biscay really does slow Thursday's sailings. The header badge shows the lead time (`T+87h`).
+- **Open-sea lanes:** severe forecast conditions at a lane's mid-point slow the middle three-fifths of that passage. Hub conditions affect roughly the first or last fifth of each leg. Lanes show `≈F8`-style flags on the chart and an *OPEN SEA* line in the corridor hover card.
 - **Severity → penalties** (`weatherImpact`):
   - wind > 45 km/h (about Beaufort 7, *near gale*): maritime speed −12 % to −40 %, and roads lose about a third of that;
   - precipitation ≥ 4 mm or heavy-rain/snow WMO codes: roads −22 %, rail −8 %, sea −6 %;
@@ -146,7 +158,7 @@ Every edge is at least as long as the straight line between its ends (tortuosity
 
   Conditions at a terminal affect roughly the first or last fifth of each leg.
 - **Status badge** reads `LIVE`, `CACHED` or `SYNTHETIC` (the lamp is green, amber or hollow) and shows the fetch time and the number of severe hubs. Click it to refresh.
-- **Fallbacks:** results are cached in `localStorage` for 30 minutes. If the network fails, the cache is used. With no cache, a deterministic synthetic sea state (seeded by hub and UTC hour) keeps the simulator working offline. Every storage call is wrapped in `try/catch`.
+- **Fallbacks:** results are cached in `localStorage` for 30 minutes, and a cached forecast advances its base hour by the time elapsed since it was fetched. If the network fails, the cache is used. With no cache, a deterministic synthetic 7-day sea state with occasional gales keeps the simulator working offline. Every storage call is wrapped in `try/catch`.
 - Hub hover cards show live temperature, wind (km/h and Beaufort force), WMO weather description and precipitation. Severe hubs get an `F7`/`TS`/`RA` flag on the chart.
 
 ## Disruption model
@@ -176,6 +188,7 @@ The product resembles a **ship's bridge running an ECDIS passage plan**, so ever
 | **ECDIS EBL / pick report**: an electronic bearing line from own ship plus bracketed cursor pick reports | Guide cards point at their target with a dashed **EBL** and a live `BRG 270°` readout. Spotlights and hover cards use corner **pick-report brackets**. |
 | **Notices to Mariners**: numbered official corrections to charts | Toasts are numbered *"Notice to Mariners · No. 0007"*. |
 | **Control-tower UIs** (project44 Movement's disruption map, Flexport's "watchtower" dashboard) ([project44](https://www.project44.com/blog/project44-enhances-movement-platform-with-new-capabilities-to-help-customers-mitigate-supply-chain-disruption/), [Flexport UX](https://medium.com/flexport-ux/the-flexport-dashboard-2-0-2524f8e92245)) | Inputs on the left, the chart in the middle, outcomes on the right; disruptions shown *on the map*, with the impact on in-flight convoys spelled out in the deck log. |
+| **Ternary diagrams / simplex plots** (the standard way to show three proportions that sum to one, as in soil-texture and phase diagrams) | **Fig. 2**: the weight triangle becomes an interactive decision map, the operations-research view of the trade-off in a single figure. |
 | **NN/g onboarding research**: pushed tutorials didn't improve task success and made tasks feel harder ([NN/g mobile tutorials](https://www.nngroup.com/articles/mobile-tutorials/), [NN/g onboarding](https://www.nngroup.com/articles/mobile-app-onboarding/)) | The guide is **opt-in** ("Embark pilot / Not now"), offered once, never forced, and always reachable with **G**, the header key, or the manual's per-panel mini tours. |
 
 **Typography.** *Newsreader Italic* for headings follows the hydrographic convention of italic lettering for water features. *Schibsted Grotesk* is the UI text face. *Martian Mono* (width axis set to 87.5 %) handles labels and data, and *Saira Stencil One* is used for the KPIs, the sim clock and the brand, after container stencils. The single-weight stencil face sets `font-synthesis: none`, so it is never faux-bolded.
@@ -189,7 +202,7 @@ The product resembles a **ship's bridge running an ECDIS passage plan**, so ever
 ### First-run guide (pilot)
 
 - Invitation shown once (`localStorage`, `try/catch`): **Embark pilot** or **Not now**.
-- 13 steps: chart → voyage → weights → plotted track & KPIs → Pareto → crisis drills → chart tools → hazards → sandbox console → convoys & deck log → leg breakdown → share/export → where to reopen.
+- 14 steps: chart → voyage & allowed modes → weights → plotted track & KPIs → Pareto → decision regions → crisis drills → chart tools → hazards & forecast → sandbox console → convoys, scoreboard & log → leg breakdown → share/export → where to reopen.
 - Cut-out veil built from four panes, so the target stays clickable · bracketed spotlight · EBL leader with bearing · `n / N` and a sounding-scale progress bar · Back / Next / Disembark · ✕ · ←/→/Esc · focus moves into the card with a focus trap · `aria-live` announcements · repositions on resize and scroll (rAF loop) · scrolls targets into view below the sticky header · docks to the top or bottom on phones.
 - **Help drawer (`?`)**: full tour plus per-panel tours (chart, plan, telemetry, sandbox), keyboard map, a five-step "how it works" pipeline, and a glossary (TEU, landed cost, dwell, modal transfer, chokepoint, Pareto, A\*, Beaufort, SGR/MGR, ICD, ISO 6346, S-52 palettes).
 
@@ -201,13 +214,33 @@ The product resembles a **ship's bridge running an ECDIS passage plan**, so ever
 | *Dusk · Indian Ocean Cyclone: a drifting cell over the Arabian Sea* | *Day · Mombasa strike: diverted via Dar es Salaam, the Central Line and the Lake Victoria ferry* |
 | ![Pilot guide](docs/screenshots/04-pilot-guide.png) | ![Chaos sandbox](docs/screenshots/06-chaos-sandbox.png) |
 | *Pilot guide: pennant step, EBL bearing, bracketed spotlight* | *Chaos mode: Bab-el-Mandeb closes and seven convoys re-plan via the Cape* |
+| ![Fig. 2 decision regions](docs/screenshots/10-fig2-decision-regions.png) | ![Following a convoy](docs/screenshots/11-follow-convoy.png) |
+| *Fig. 2 · Suez closed: rail land bridge (magenta) wins 55 % of weight mixes, the Cape 45 %* | *Following a convoy: dashed track ahead, ring, scoreboard, forecast lead* |
 | ![Help drawer](docs/screenshots/05-help-drawer.png) | ![Mobile](docs/screenshots/07-mobile-night.png) |
 | *Bridge manual (`?`)* | *Phone, 390 px* |
 
 ## Testing
 
-- **Unit (`npm test`)**, 10 tests: network size and schema invariants (including *edge length ≥ great-circle distance*), heap ordering and `decreaseKey`, **A\* = Dijkstra** on 80 random cases, Suez structural reroute, Mombasa diversion, scenario solve with a Pareto set in under 250 ms, storm intersection, Beaufort bands, ISO 6346 check digits, convoy hold/reroute/delivery, and congestion re-timing.
-- **E2E (`npm run test:e2e`)**, 11 Playwright tests: load with no console errors · Suez drill re-plot + verdict + toast + hash · Pareto keyboard readout and click-to-plot · **guide invite → tour across panels → Esc → never shown again → reopen** · help drawer (`?`, Esc, partial tour) · sandbox clock / dispatch / chaos / speed / reset · map hub hover card → pick menu → strike · scenario link round-trip · manifest JSON download · **390 px with no horizontal overflow and a docked guide** · themed 404. Functional tests pre-mark the guide as seen.
+- **Unit (`npm test`)**, 13 tests: forecast reading via `weatherAt` and open-sea lane penalties, mode constraints honoured by every candidate, the diesel drill's road→sea/rail shift, plus network size and schema invariants (including *edge length ≥ great-circle distance*), heap ordering and `decreaseKey`, **A\* = Dijkstra** on 80 random cases, Suez structural reroute, Mombasa diversion, scenario solve with a Pareto set in under 250 ms, storm intersection, Beaufort bands, ISO 6346 check digits, convoy hold/reroute/delivery, and congestion re-timing.
+- **E2E (`npm run test:e2e`)**, 14 Playwright tests: Fig. 2 compute + click/keyboard weights · allowed-modes constraint + link · scoreboard, convoy follow and forecast lead, plus load with no console errors · Suez drill re-plot + verdict + toast + hash · Pareto keyboard readout and click-to-plot · **guide invite → tour across panels → Esc → never shown again → reopen** · help drawer (`?`, Esc, partial tour) · sandbox clock / dispatch / chaos / speed / reset · map hub hover card → pick menu → strike · scenario link round-trip · manifest JSON download · **390 px with no horizontal overflow and a docked guide** · themed 404. Functional tests pre-mark the guide as seen.
+
+## Design review log (v1.1)
+
+A critique pass on the first release, and what changed:
+
+| Observed weakness | Change |
+| --- | --- |
+| Weather was a snapshot at hubs only; the sandbox clock ran days ahead while the weather stood still, and mid-ocean storms never came from real data | 7-day hourly forecast for hubs **and** sea-lane mid-points; the router reads the forecast hour matching the sim clock (`T+n` badge) |
+| Three weight sliders gave no sense of *which* route wins for *which* priorities | **Fig. 2** decision-region map with drag-to-set weights and keyboard nudging |
+| The sandbox had no outcome metrics, and convoys could not be followed | Scoreboard (sailed, delivered, on-time %, avg delay, reroutes, holds, CO₂e, spend); click-to-follow with track-ahead and ring |
+| No way to forbid a mode | *Allowed modes* voyage constraint, carried in the URL and the manifest |
+| *Diesel +60%* never changed the route | Drill retargeted to Mombasa → Dodoma, where the shock shifts cargo off the road |
+| Same hubs via different modes read identically in the candidate list | Mode hop marks between hub codes (sea, rail, dashed road) |
+| Hub labels overlapped at low zoom | Low-zoom declutter: only route, O/D, hazard and hovered hubs are labelled |
+| Pareto axis title collided with ticks; tag labels overlapped bubbles | Horizontal axis title; collision-aware label placement |
+| Convoy and hazard lists re-rendered every 400 ms, so clicks could land on a replaced button | Lists rebuild only when their structure changes; values are patched in place |
+| Fig. 2 could fall behind a new hazard while the sandbox ran (debounce starvation) | Throttle that always fires with the latest context |
+| Map layers were rebuilt every frame even when idle | Scene-key gate: idle frames skip `setProps` |
 
 ## Deploying to GitHub Pages
 

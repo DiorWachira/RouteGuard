@@ -105,19 +105,19 @@ test.describe('RouteGuard', () => {
     await page.getByRole('button', { name: 'Embark pilot' }).click();
     const card = page.locator('.pilot-card');
     await expect(card).toBeVisible();
-    await expect(card.locator('.pilot-count')).toContainText('01 / 13');
+    await expect(card.locator('.pilot-count')).toContainText('01 / 14');
     await expect(card.locator('.pilot-title')).toHaveText('This is your passage chart');
     await page.keyboard.press('ArrowRight');
-    await expect(card.locator('.pilot-count')).toContainText('02 / 13');
+    await expect(card.locator('.pilot-count')).toContainText('02 / 14');
     await expect(card.locator('.pilot-title')).toHaveText('Set the voyage');
     await card.getByRole('button', { name: 'Next' }).click();
-    await expect(card.locator('.pilot-count')).toContainText('03 / 13');
+    await expect(card.locator('.pilot-count')).toContainText('03 / 14');
     // jump through telemetry → sandbox → convoys
-    for (let i = 0; i < 6; i++) await page.keyboard.press('ArrowRight');
+    for (let i = 0; i < 7; i++) await page.keyboard.press('ArrowRight');
     await expect(card.locator('.pilot-title')).toHaveText('Run the sandbox');
     await expect(page.locator('.pilot-ring')).toBeVisible();
     await page.keyboard.press('ArrowLeft');
-    await expect(card.locator('.pilot-count')).toContainText('08 / 13');
+    await expect(card.locator('.pilot-count')).toContainText('09 / 14');
     await page.keyboard.press('Escape');
     await expect(card).toBeHidden();
     await page.reload();
@@ -233,6 +233,62 @@ test.describe('RouteGuard', () => {
     await page.getByRole('button', { name: 'Embark pilot' }).click();
     await expect(page.locator('.pilot-card.is-docked')).toBeVisible();
     await ctx.close();
+  });
+
+  test('Fig. 2 decision regions: map computes, click sets weights', async ({ page }) => {
+    await guideSeen(page);
+    await page.goto('/');
+    await ready(page);
+    const legend = page.locator('#simplex-legend li');
+    await expect(legend.first()).toBeVisible({ timeout: 15_000 });
+    expect(await legend.count()).toBeGreaterThan(1);
+    await expect(page.locator('#simplex-legend li.is-sel')).toHaveCount(1);
+    const canvas = page.locator('#simplex');
+    await canvas.scrollIntoViewIfNeeded();
+    const box = await canvas.boundingBox();
+    // near the TIME vertex (top centre) → time weight dominates
+    await page.mouse.click(box.x + box.width / 2, box.y + 34);
+    await expect.poll(() => page.evaluate(() => window.routeguard.state.weights.time)).toBeGreaterThan(80);
+    await expect(page.locator('#o-time')).toHaveText(/^(8|9)\d%|100%$/);
+    await expect(page.locator('#simplex-readout')).toBeVisible();
+    // keyboard nudges carbon up
+    await canvas.focus();
+    const before = await page.evaluate(() => window.routeguard.state.weights.co2);
+    await page.keyboard.press('ArrowRight');
+    await expect.poll(() => page.evaluate(() => window.routeguard.state.weights.co2)).toBeGreaterThan(before);
+  });
+
+  test('allowed modes: excluding rail removes rail from every candidate and survives the link', async ({ page }) => {
+    await guideSeen(page);
+    await page.goto('/');
+    await ready(page);
+    await page.locator('#mode-chips [data-mode="RAIL"]').click();
+    await expect(page.locator('#mode-chips [data-mode="RAIL"]')).toHaveAttribute('aria-pressed', 'false');
+    const modes = await page.evaluate(() => window.routeguard.state.solution.candidates.flatMap((r) => r.legs.map((l) => l.mode)));
+    expect(modes).not.toContain('RAIL');
+    expect(page.url()).toContain('m=ST');
+    // cannot exclude every mode
+    await page.locator('#mode-chips [data-mode="ROAD"]').click();
+    await page.locator('#mode-chips [data-mode="MARITIME"]').click();
+    await expect(page.locator('#mode-chips [data-mode="MARITIME"]')).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  test('sandbox: scoreboard counts, follow a convoy, live forecast lead advances', async ({ page }) => {
+    await guideSeen(page);
+    await page.goto('/');
+    await ready(page);
+    await expect(page.locator('#scoreboard')).toContainText('Sailed');
+    await page.getByRole('button', { name: 'Dispatch convoy' }).click();
+    await page.locator('.convoy').first().click();
+    await expect(page.locator('#follow-chip')).toBeVisible();
+    await expect(page.locator('#follow-chip')).toContainText('RGUU');
+    await expect(page.locator('.convoy.is-sel')).toHaveCount(1);
+    await page.locator('#speed button', { hasText: '72×' }).click();
+    await expect(page.locator('#meteo-lead')).toHaveText(/T\+\d+h/, { timeout: 15_000 });
+    await page.keyboard.press('Escape');
+    await expect(page.locator('#follow-chip')).toBeHidden();
+    const sailed = await page.evaluate(() => window.routeguard.sandbox.stats.dispatched);
+    expect(sailed).toBeGreaterThanOrEqual(2);
   });
 
   test('404 page is themed', async ({ page }) => {
