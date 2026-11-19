@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RouteGuard — Freight Disruption Simulator</title>
+  <meta name="description" content="Interactive geospatial supply-chain simulator: multi-objective A* routing across sea, rail and road with live Open-Meteo weather, crisis scenarios and a real-time convoy sandbox." />
+  <meta name="theme-color" content="#05080d" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%2305080d'/%3E%3Cpath d='M6 24 L13 10 L19 18 L26 7' fill='none' stroke='%23e85ca8' stroke-width='3'/%3E%3Ccircle cx='13' cy='10' r='3' fill='%2305080d' stroke='%23e85ca8' stroke-width='2'/%3E%3Ccircle cx='19' cy='18' r='3' fill='%2305080d' stroke='%23e85ca8' stroke-width='2'/%3E%3C/svg%3E" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Martian+Mono:wdth,wght@75..112.5,400..700&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400;1,6..72,500&family=Saira+Stencil+One&family=Schibsted+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" />
+  <link rel="stylesheet" href="css/styles.css" />
+  <script>
+    // Apply the saved / system display palette before first paint (ECDIS Day · Dusk · Night).
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem('routeguard.palette'); } catch (e) {}
+      if (!t) t = window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'day' : 'night';
+      document.documentElement.setAttribute('data-palette', t);
+    })();
+  </script>
+</head>
+<body>
+  <a class="skip" href="#plan">Skip to passage plan</a>
+
+  <header class="bridge-bar" role="banner">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 40 40" aria-hidden="true">
+        <rect x="1" y="1" width="38" height="38" fill="none" stroke="currentColor" stroke-opacity=".35" />
+        <path d="M6 31 L15 12 L24 23 L34 8" fill="none" stroke="var(--signal)" stroke-width="3" />
+        <circle cx="15" cy="12" r="3.4" fill="var(--panel)" stroke="var(--signal)" stroke-width="2" />
+        <circle cx="24" cy="23" r="3.4" fill="var(--panel)" stroke="var(--signal)" stroke-width="2" />
+      </svg>
+      <div class="brand-text">
+        <span class="brand-name">RouteGuard</span>
+        <span class="brand-sub mono">Passage planning · disruption sandbox</span>
+      </div>
+    </div>
+
+    <nav class="crisis" id="crisis" aria-label="Crisis scenarios">
+      <span class="crisis-label mono">Crisis drills</span>
+      <div class="crisis-row" id="crisis-row"></div>
+    </nav>
+
+    <div class="bar-right">
+      <button type="button" class="meteo" id="meteo-badge" aria-describedby="meteo-detail" title="Live weather status — click to refresh">
+        <span class="lamp" aria-hidden="true"></span>
+        <span class="meteo-text mono"><b id="meteo-status">LOADING</b> METEO TELEMETRY</span>
+        <span class="meteo-detail mono" id="meteo-detail">Open-Meteo · contacting</span>
+      </button>
+      <div class="palette-switch" role="radiogroup" aria-label="Display palette (S-52 day, dusk, night)">
+        <button type="button" role="radio" data-palette="day" aria-checked="false" title="Day palette">Day</button>
+        <button type="button" role="radio" data-palette="dusk" aria-checked="false" title="Dusk palette">Dusk</button>
+        <button type="button" role="radio" data-palette="night" aria-checked="false" title="Night palette">Night</button>
+      </div>
+      <button type="button" class="flag-key" id="guide-key" title="Pilot guide (G)">
+        <span class="flag-wrap" id="flag-h"></span><span class="mono">Pilot</span>
+      </button>
+      <button type="button" class="icon-btn help-key" id="help-key" aria-label="Help, shortcuts and glossary (?)" title="Help (?)">?</button>
+    </div>
+  </header>
+
+  <main class="console" id="main">
+    <!-- ───────────── Passage plan (inputs) ───────────── -->
+    <aside class="panel plan" id="plan" aria-label="Passage plan">
+      <div class="panel-head">
+        <span class="panel-no mono">A</span>
+        <h2>Passage plan</h2>
+      </div>
+
+      <section class="block" id="voyage" aria-labelledby="h-voyage">
+        <h3 id="h-voyage"><span class="sec mono">§1</span> Voyage</h3>
+        <div class="seg-switch" role="radiogroup" aria-label="Network" id="network-switch"></div>
+        <div class="od">
+          <label class="field">
+            <span class="field-label mono">Origin</span>
+            <select id="origin"></select>
+          </label>
+          <button type="button" class="icon-btn swap" id="swap-od" aria-label="Swap origin and destination" title="Swap">⇅</button>
+          <label class="field">
+            <span class="field-label mono">Destination</span>
+            <select id="destination"></select>
+          </label>
+        </div>
+      </section>
+
+      <section class="block" id="weights" aria-labelledby="h-weights">
+        <h3 id="h-weights"><span class="sec mono">§2</span> Objective weights</h3>
+        <div class="chips" id="weight-presets" role="group" aria-label="Weight presets">
+          <button type="button" class="chip" data-w="40,35,25">Balanced</button>
+          <button type="button" class="chip" data-w="100,0,0">Speed</button>
+          <button type="button" class="chip" data-w="0,100,0">Cost</button>
+          <button type="button" class="chip" data-w="0,15,85">Green</button>
+        </div>
+        <div class="weight">
+          <label for="w-time"><span class="mono">w<sub>t</sub></span> Transit time</label>
+          <output class="mono" id="o-time" for="w-time">—</output>
+          <input type="range" id="w-time" min="0" max="100" step="1" value="40" />
+        </div>
+        <div class="weight">
+          <label for="w-cost"><span class="mono">w<sub>c</sub></span> Landed cost</label>
+          <output class="mono" id="o-cost" for="w-cost">—</output>
+          <input type="range" id="w-cost" min="0" max="100" step="1" value="35" />
+        </div>
+        <div class="weight">
+          <label for="w-co2"><span class="mono">w<sub>e</sub></span> Carbon</label>
+          <output class="mono" id="o-co2" for="w-co2">—</output>
+          <input type="range" id="w-co2" min="0" max="100" step="1" value="25" />
+        </div>
+        <div class="trim" aria-hidden="true"><span class="trim-t"></span><span class="trim-c"></span><span class="trim-e"></span></div>
+        <p class="hint mono" id="weights-sum">Σ w = 1.00</p>
+      </section>
+
+      <section class="block" id="hazards" aria-labelledby="h-hazards">
+        <h3 id="h-hazards"><span class="sec mono">§3</span> Hazards <span class="count mono" id="hazard-count">0</span></h3>
+        <ul class="hazard-list" id="hazard-list"></ul>
+        <div class="weight fuel">
+          <label for="fuel">Fuel price shock</label>
+          <output class="mono" id="o-fuel" for="fuel">±0%</output>
+          <input type="range" id="fuel" min="-20" max="100" step="5" value="0" />
+          <div class="scale mono" aria-hidden="true"><span>−20%</span><span>0</span><span>+50%</span><span>+100%</span></div>
+        </div>
+        <label class="toggle">
+          <input type="checkbox" id="use-weather" checked />
+          <span class="toggle-ui" aria-hidden="true"></span>
+          <span>Apply live weather penalties</span>
+        </label>
+        <button type="button" class="btn btn--ghost btn--block" id="clear-hazards">Clear all hazards</button>
+      </section>
+
+      <section class="block" id="share" aria-labelledby="h-share">
+        <h3 id="h-share"><span class="sec mono">§4</span> Share &amp; export</h3>
+        <div class="row">
+          <button type="button" class="btn" id="copy-link">Copy scenario link</button>
+          <button type="button" class="btn" id="download-manifest">Route manifest (JSON)</button>
+        </div>
+        <p class="hint">The URL hash carries voyage, weights, fuel and every hazard.</p>
+      </section>
+    </aside>
+
+    <!-- ───────────── The chart ───────────── -->
+    <section class="chart-area" aria-label="Passage chart">
+      <div id="map" class="map" role="application" aria-label="Interactive freight network chart. Use the panels for keyboard control." tabindex="-1"></div>
+
+      <div class="tool-rail" id="tools" role="toolbar" aria-label="Chart tools">
+        <button type="button" class="tool is-on" data-tool="select" aria-pressed="true" title="Select / inspect (S)"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 3l14 8-6 2-2 6z" fill="none" stroke="currentColor" stroke-width="1.8"/></svg><span>Select</span></button>
+        <button type="button" class="tool" data-tool="storm" aria-pressed="false" title="Drop a storm cell"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5c-4 0-6 3-6 6 0 3.5 3 6 6 6M12 19c4 0 6-3 6-6 0-3.5-3-6-6-6" fill="none" stroke="currentColor" stroke-width="1.8"/><circle cx="12" cy="12" r="1.6" fill="currentColor"/></svg><span>Storm</span></button>
+        <button type="button" class="tool" data-tool="strike" aria-pressed="false" title="Congest / strike a hub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 19V6h11M17 6v4M4 19h16" fill="none" stroke="currentColor" stroke-width="1.8"/></svg><span>Strike</span></button>
+        <button type="button" class="tool" data-tool="closure" aria-pressed="false" title="Close a hub or corridor"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 5v14M17 5v14" stroke="currentColor" stroke-width="1.8"/><path d="M4 12h16" stroke="currentColor" stroke-width="3"/></svg><span>Close</span></button>
+        <div class="tool-opt" id="storm-opt" hidden>
+          <label for="storm-radius" class="mono">Radius <output id="o-storm" for="storm-radius">600 km</output></label>
+          <input type="range" id="storm-radius" min="50" max="1500" step="25" value="600" />
+        </div>
+      </div>
+
+      <div class="legend" id="legend" aria-label="Chart legend">
+        <div class="lg-row"><i class="lg-line lg-sea"></i><span>Sea</span><i class="lg-line lg-rail"></i><span>Rail</span><i class="lg-line lg-road"></i><span>Road</span></div>
+        <div class="lg-row"><i class="lg-track"></i><span>Plotted track</span><i class="lg-alt"></i><span>Alternates</span></div>
+        <div class="lg-row"><i class="lg-ghost"></i><span>Calm-world plan</span><span class="lg-placard" id="lg-placard"></span><span>Hazard</span></div>
+      </div>
+
+      <div class="hover-card" id="hover-card" role="status" hidden></div>
+      <div class="pick-card" id="pick-card" role="dialog" aria-label="Chart object actions" hidden></div>
+
+      <div class="warmup" id="warmup" aria-live="polite">
+        <svg class="warmup-rose" viewBox="0 0 120 120" aria-hidden="true">
+          <circle cx="60" cy="60" r="54" fill="none" stroke="currentColor" stroke-opacity=".35"/>
+          <circle cx="60" cy="60" r="36" fill="none" stroke="currentColor" stroke-opacity=".2"/>
+          <g class="ticks" stroke="currentColor" stroke-opacity=".5"></g>
+          <line class="ebl" x1="60" y1="60" x2="60" y2="6" stroke="var(--signal)" stroke-width="2"/>
+        </svg>
+        <p class="mono">Taking bearings · plotting corridors</p>
+      </div>
+      <div class="fault" id="fault" hidden></div>
+
+      <div class="console-bar" id="console" role="group" aria-label="Sandbox simulation console">
+        <div class="clock">
+          <button type="button" class="btn btn--primary play" id="play" aria-pressed="false" title="Run / pause clock (Space)"><span class="play-ico" aria-hidden="true"></span><span class="play-txt">Run</span></button>
+          <div class="clock-face">
+            <span class="mono clock-label">SIM CLOCK</span>
+            <span class="clock-time" id="sim-clock">D+00 00:00</span>
+          </div>
+          <div class="seg-switch speed" role="radiogroup" aria-label="Simulation speed" id="speed"></div>
+        </div>
+        <div class="console-actions">
+          <button type="button" class="btn" id="dispatch" title="Dispatch a convoy on the plotted track (D)">Dispatch convoy</button>
+          <label class="toggle small"><input type="checkbox" id="auto-dispatch" /><span class="toggle-ui" aria-hidden="true"></span><span>Auto</span></label>
+          <label class="toggle small"><input type="checkbox" id="chaos" /><span class="toggle-ui" aria-hidden="true"></span><span>Chaos</span></label>
+          <button type="button" class="btn btn--ghost" id="reset-sim" title="Reset the sandbox">Reset</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ───────────── Telemetry (outputs) ───────────── -->
+    <aside class="panel telemetry" id="telemetry" aria-label="Route telemetry">
+      <div class="panel-head">
+        <span class="panel-no mono">B</span>
+        <h2>Telemetry</h2>
+        <span class="solve mono" id="solve-time" title="Time to solve every candidate">—</span>
+      </div>
+
+      <section class="kpis" id="kpis" aria-label="Plotted route key figures" aria-live="polite">
+        <div class="kpi"><span class="kpi-label mono">Transit</span><span class="kpi-value" id="k-time">—</span><span class="kpi-delta mono" id="d-time"></span></div>
+        <div class="kpi"><span class="kpi-label mono">Landed cost / TEU</span><span class="kpi-value" id="k-cost">—</span><span class="kpi-delta mono" id="d-cost"></span></div>
+        <div class="kpi"><span class="kpi-label mono">Carbon tCO₂e / TEU</span><span class="kpi-value" id="k-co2">—</span><span class="kpi-delta mono" id="d-co2"></span></div>
+        <div class="kpi kpi--verdict"><span class="kpi-label mono">vs calm baseline</span><span class="verdict" id="k-verdict">—</span></div>
+      </section>
+
+      <section class="block" aria-labelledby="h-pareto">
+        <h3 id="h-pareto"><span class="sec mono">Fig. 1</span> Pareto trade-off</h3>
+        <div class="pareto-wrap" id="pareto-wrap">
+          <canvas id="pareto" tabindex="0" role="img" aria-label="Pareto chart of candidate routes: landed cost against transit time, bubble size is carbon. Use arrow keys to inspect, Enter to plot."></canvas>
+          <div class="readout" id="pareto-readout" hidden></div>
+        </div>
+        <p class="caption">
+          <b>Fig. 1</b> — <span id="fig-caption">Each bubble is a candidate route; left is cheaper, lower is faster, area is CO₂e.</span>
+          <span class="caption-key mono"><i class="ck ck-sel"></i>plotted <i class="ck ck-eff"></i>efficient <i class="ck ck-dom"></i>dominated <i class="ck ck-base">×</i>calm</span>
+        </p>
+        <details class="table-view">
+          <summary class="mono">Table view</summary>
+          <div id="pareto-table"></div>
+        </details>
+      </section>
+
+      <section class="block" aria-labelledby="h-cands">
+        <h3 id="h-cands"><span class="sec mono">§5</span> Candidate routes</h3>
+        <ol class="cands" id="cands"></ol>
+      </section>
+
+      <section class="block" id="legs" aria-labelledby="h-legs">
+        <h3 id="h-legs"><span class="sec mono">§6</span> Leg breakdown</h3>
+        <div id="leg-strip"></div>
+        <ol class="leg-list" id="leg-list"></ol>
+      </section>
+
+      <section class="block" id="convoys" aria-labelledby="h-convoys">
+        <h3 id="h-convoys"><span class="sec mono">§7</span> Convoys at sea <span class="count mono" id="convoy-count">0</span></h3>
+        <ul class="convoy-list" id="convoy-list"></ul>
+        <h4 class="sub mono">Deck log</h4>
+        <ol class="deck-log" id="deck-log" aria-live="off"></ol>
+      </section>
+    </aside>
+  </main>
+
+  <!-- Help drawer -->
+  <aside class="help" id="help" role="dialog" aria-modal="true" aria-labelledby="help-title" hidden>
+    <div class="help-scrim" data-close></div>
+    <div class="help-sheet">
+      <header class="help-head">
+        <h2 id="help-title">Bridge manual</h2>
+        <button type="button" class="icon-btn" data-close aria-label="Close help (Esc)">✕</button>
+      </header>
+      <section>
+        <h3><span class="sec mono">01</span> Pilot</h3>
+        <div class="row wrap">
+          <button type="button" class="btn btn--primary" data-tour="all">Full passage (13 steps)</button>
+          <button type="button" class="btn" data-tour="chart">Chart only</button>
+          <button type="button" class="btn" data-tour="plan">Passage plan</button>
+          <button type="button" class="btn" data-tour="telemetry">Telemetry</button>
+          <button type="button" class="btn" data-tour="sandbox">Sandbox</button>
+        </div>
+      </section>
+      <section>
+        <h3><span class="sec mono">02</span> Keyboard</h3>
+        <dl class="keys">
+          <div><dt><kbd>?</kbd></dt><dd>Open this manual</dd></div>
+          <div><dt><kbd>G</kbd></dt><dd>Start the pilot guide</dd></div>
+          <div><dt><kbd>Space</kbd></dt><dd>Run / pause the sim clock</dd></div>
+          <div><dt><kbd>D</kbd></dt><dd>Dispatch a convoy</dd></div>
+          <div><dt><kbd>1</kbd>–<kbd>4</kbd></dt><dd>Crisis drills</dd></div>
+          <div><dt><kbd>S</kbd></dt><dd>Select tool</dd></div>
+          <div><dt><kbd>F</kbd></dt><dd>Fit chart to plotted track</dd></div>
+          <div><dt><kbd>T</kbd></dt><dd>Cycle Day / Dusk / Night</dd></div>
+          <div><dt><kbd>Esc</kbd></dt><dd>Close menus, guide, manual</dd></div>
+          <div><dt><kbd>←</kbd><kbd>→</kbd></dt><dd>Step the guide · inspect Fig. 1</dd></div>
+        </dl>
+      </section>
+      <section>
+        <h3><span class="sec mono">03</span> How it works</h3>
+        <ol class="pipeline">
+          <li><b>Observe</b> Open-Meteo wind, rain and weather code for every hub (one batched call; cached, synthetic fallback offline).</li>
+          <li><b>Compile</b> Weather, strikes, closures, storm cells and fuel shock become per-hub and per-corridor modifiers.</li>
+          <li><b>Search</b> Multi-objective A* over (hub × arrival mode) states with a binary min-heap and an admissible great-circle heuristic.</li>
+          <li><b>Compare</b> Fastest, cheapest, greenest and edge-penalised alternates, plus a weight-simplex sweep, filtered to the Pareto set.</li>
+          <li><b>Simulate</b> Convoys advance on the sim clock and re-plan at the next hub whenever the context changes.</li>
+        </ol>
+      </section>
+      <section>
+        <h3><span class="sec mono">04</span> Glossary</h3>
+        <dl class="glossary">
+          <div><dt>TEU</dt><dd>Twenty-foot equivalent unit: one standard container. Costs and CO₂e are per TEU.</dd></div>
+          <div><dt>Landed cost</dt><dd>Line-haul, handling, transfers and surcharges from origin to destination gate.</dd></div>
+          <div><dt>Dwell</dt><dd>Time a box spends in a terminal: berth, yard, customs, gauge change.</dd></div>
+          <div><dt>Modal transfer</dt><dd>A lift between sea, rail and road. It costs hours, dollars and CO₂e.</dd></div>
+          <div><dt>Chokepoint</dt><dd>A strait, canal or border that many corridors depend on: Suez, Bab-el-Mandeb, Malaba.</dd></div>
+          <div><dt>Pareto-efficient</dt><dd>No other route is at least as good on time, cost and carbon and better on one.</dd></div>
+          <div><dt>A*</dt><dd>Best-first search guided by a lower bound on the remaining cost. With an admissible bound it is exact.</dd></div>
+          <div><dt>Beaufort</dt><dd>Wind force 0–12. RouteGuard flags hubs above 45 km/h (about force 7).</dd></div>
+          <div><dt>SGR / MGR</dt><dd>Standard-gauge and metre-gauge railway, e.g. Kenya's Mombasa–Nairobi SGR.</dd></div>
+          <div><dt>ICD</dt><dd>Inland container depot (dry port), such as Nairobi ICD or Naivasha.</dd></div>
+          <div><dt>ISO 6346</dt><dd>Container numbering: owner code, category, serial and a check digit, shown boxed.</dd></div>
+          <div><dt>Day / Dusk / Night</dt><dd>Display palettes modelled on ECDIS (IHO S-52) bridge colour tables.</dd></div>
+        </dl>
+      </section>
+    </div>
+  </aside>
+
+  <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+  <div class="sr-only" id="announcer" aria-live="polite"></div>
+
+  <noscript><p class="noscript">RouteGuard needs JavaScript to plot routes.</p></noscript>
+
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://unpkg.com/deck.gl@8.9.35/dist.min.js"></script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
